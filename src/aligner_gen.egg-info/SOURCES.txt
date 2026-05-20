@@ -1,0 +1,11 @@
+pyproject.toml
+src/aligner_gen/__init__.py
+src/aligner_gen/__main__.py
+src/aligner_gen/io.py
+src/aligner_gen/selection.py
+src/aligner_gen/viewer.py
+src/aligner_gen.egg-info/PKG-INFO
+src/aligner_gen.egg-info/SOURCES.txt
+src/aligner_gen.egg-info/dependency_links.txt
+src/aligner_gen.egg-info/requires.txt
+src/aligner_gen.egg-info/top_level.txt

@@ -1,0 +1,10 @@
+Metadata-Version: 2.4
+Name: aligner-gen
+Version: 0.1.0
+Summary: Dental aligner generator from STL scans
+Requires-Python: >=3.10
+Requires-Dist: numpy>=1.26
+Requires-Dist: scipy>=1.11
+Requires-Dist: trimesh>=4.0
+Requires-Dist: pyvista>=0.43
+Requires-Dist: vtk>=9.3

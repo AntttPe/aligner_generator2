@@ -1,0 +1,566 @@
+"""Interactive viewer — rysowanie konturu + fill wnętrza.
+
+Workflow
+--------
+1. Klikasz punkty na meshu — każdy punkt to waypoint. Kolejne waypointy są
+   automatycznie łączone najkrótszą ścieżką po krawędziach mesha (geodesic).
+2. Kliknij blisko **pierwszego** waypointa (lub naciśnij C) aby zamknąć pętlę.
+3. F lub przycisk [Fill] — wypełnia wnętrze pętli kolorem (oznacza powierzchnię
+   przylegania nakładki).
+4. S lub przycisk [Save] — zapisuje selekcję dla późniejszych iteracji
+   algorytmu generowania (debug — żeby nie malować od nowa).
+
+Hotkeye
+-------
+C  zamknij pętlę                  I  odwróć fill (mniejsza/większa strona)
+F  wypełnij wnętrze               Z  usuń ostatni waypoint
+X  wyczyść wszystko               S  zapisz selekcję
+L  wczytaj selekcję               Q/Esc  wyjście
+"""
+from __future__ import annotations
+
+import numpy as np
+import pyvista as pv
+
+from pathlib import Path
+
+import trimesh
+
+from .aligner import AlignerParams, generate_aligner
+from .io import LoadedMesh, load_selection, save_selection
+from .selection import (
+    build_edge_graph,
+    fill_from_seed,
+    fill_interior,
+    nearest_vertex,
+    shortest_path,
+)
+
+ALIGNER_COLOR = "#06b6d4"
+OUTPUT_DIR = Path(__file__).resolve().parents[2] / "data" / "output"
+
+
+SCALAR_CMAP = ["#cfcfcf", "#dc2f5a"]
+CONTOUR_COLOR = "#22d3ee"
+WAYPOINT_COLOR = "#fbbf24"
+FIRST_WAYPOINT_COLOR = "#22c55e"
+CLOSE_LOOP_THRESHOLD_FACTOR = 0.02  # % bbox diagonal — jak blisko 1. waypoint = close
+
+
+class SelectionViewer:
+    def __init__(self, loaded: LoadedMesh):
+        self.loaded = loaded
+        self.mesh = loaded.mesh
+
+        # state
+        self.waypoints: list[int] = []
+        self.path_segments: list[np.ndarray] = []
+        self.boundary_mask = np.zeros(len(self.mesh.vertices), dtype=bool)
+        self.fill_mask = np.zeros(len(self.mesh.vertices), dtype=bool)
+        self.is_closed = False
+        self._awaiting_seed = False  # po G — następny klik to ziarno fillu
+
+        # aligner state
+        self.aligner_mesh: trimesh.Trimesh | None = None
+        self._aligner_actor = None
+        self._aligner_opacity = 0.85
+        self.params = AlignerParams()
+
+        # geometry / threshold scale
+        bbox = self.mesh.bounds
+        self._bbox_diag = float(np.linalg.norm(bbox[1] - bbox[0]))
+        self._close_thresh = CLOSE_LOOP_THRESHOLD_FACTOR * self._bbox_diag
+        self._waypoint_radius = 0.004 * self._bbox_diag
+
+        print("[viewer] Buduję graf krawędzi (Dijkstra)...")
+        self.graph = build_edge_graph(self.mesh)
+
+        # auto-load — jeśli istnieje saved selection, wczytaj jako fill_mask
+        loaded_mask = load_selection(loaded)
+        if loaded_mask is not None:
+            self.fill_mask = loaded_mask
+            print(
+                f"[viewer] Auto-load: {self.fill_mask.sum()} verts "
+                f"(zaznacz jako wypełnienie, bez konturu)"
+            )
+
+        # pyvista mesh
+        faces_flat = np.hstack(
+            [np.full((len(self.mesh.faces), 1), 3, dtype=np.int64), self.mesh.faces]
+        ).ravel()
+        self.pv_mesh = pv.PolyData(np.asarray(self.mesh.vertices), faces_flat)
+        self.pv_mesh.point_data["selected"] = self._combined_mask().astype(np.uint8)
+
+        self.plotter = pv.Plotter(window_size=(1400, 900))
+        self.plotter.set_background("#1a1a1a")
+        self.plotter.add_axes()
+
+        self.plotter.add_mesh(
+            self.pv_mesh,
+            scalars="selected",
+            cmap=SCALAR_CMAP,
+            clim=(0, 1),
+            show_scalar_bar=False,
+            smooth_shading=True,
+            interpolate_before_map=True,
+            specular=0.25,
+            specular_power=12,
+        )
+
+        self._contour_actor = None
+        self._waypoint_actor = None
+        self._first_waypoint_actor = None
+
+        self._setup_picking()
+        self._setup_keys()
+        self._setup_buttons()
+        self._refresh_all()
+
+    # ---------- maski ----------
+    def _combined_mask(self) -> np.ndarray:
+        return self.boundary_mask | self.fill_mask
+
+    # ---------- input setup ----------
+    def _setup_picking(self) -> None:
+        try:
+            self.plotter.enable_surface_point_picking(
+                callback=self._on_pick,
+                show_message=False,
+                show_point=False,
+                left_clicking=True,
+            )
+        except (AttributeError, TypeError):
+            self.plotter.enable_point_picking(
+                callback=self._on_pick,
+                show_message=False,
+                show_point=False,
+                left_clicking=True,
+                use_picker="cell",
+                pickable_window=False,
+            )
+
+    def _setup_keys(self) -> None:
+        self.plotter.add_key_event("c", self._close_loop)
+        self.plotter.add_key_event("f", self._fill)
+        self.plotter.add_key_event("g", self._arm_seed_fill)
+        self.plotter.add_key_event("i", self._invert_fill)
+        self.plotter.add_key_event("z", self._undo)
+        self.plotter.add_key_event("x", self._clear)
+        self.plotter.add_key_event("s", self._save)
+        self.plotter.add_key_event("l", self._reload)
+        self.plotter.add_key_event("n", self._generate_aligner)
+        self.plotter.add_key_event("e", self._export_aligner)
+        self.plotter.add_key_event("h", self._toggle_aligner_visibility)
+
+    def _setup_buttons(self) -> None:
+        """Klikalne buttony — duplikat hotkeyów dla wygody.
+
+        Pozycje w pikselach od dolnego lewego rogu okna. Każdy button to
+        checkbox_widget z ignorowanym stanem (action-on-click).
+        """
+        specs = [
+            ("FILL [F]",      self._fill,                    "#22c55e",   20),
+            ("SEED [G]",      self._arm_seed_fill,           "#84cc16",  130),
+            ("CLOSE [C]",     self._close_loop,              "#22d3ee",  240),
+            ("UNDO [Z]",      self._undo,                    "#fbbf24",  370),
+            ("CLEAR [X]",     self._clear,                   "#94a3b8",  480),
+            ("SAVE [S]",      self._save,                    "#dc2f5a",  590),
+            ("LOAD [L]",      self._reload,                  "#a78bfa",  700),
+            ("GENERATE [N]",  self._generate_aligner,        "#f97316",  810),
+            ("EXPORT [E]",    self._export_aligner,          "#10b981",  960),
+            ("HIDE [H]",      self._toggle_aligner_visibility, "#64748b", 1090),
+        ]
+        y = 16
+        for label, cb, color, x in specs:
+            self.plotter.add_checkbox_button_widget(
+                self._wrap_action(cb),
+                value=False,
+                position=(x, y),
+                size=28,
+                border_size=2,
+                color_on=color,
+                color_off=color,
+                background_color="#333333",
+            )
+            self.plotter.add_text(
+                label,
+                position=(x + 34, y + 6),
+                font_size=9,
+                color="#e5e5e5",
+                name=f"btn_label_{label}",
+            )
+
+    @staticmethod
+    def _wrap_action(cb):
+        def _inner(_value):
+            cb()
+        return _inner
+
+    # ---------- callbacks ----------
+    def _on_pick(self, point, *_args, **_kwargs) -> None:
+        if point is None:
+            return
+        pt = np.asarray(point, dtype=float).reshape(-1)
+        if pt.size < 3:
+            return
+        new_idx = nearest_vertex(self.mesh, pt[:3])
+
+        # seed mode — klik wybiera ziarno fillu
+        if self._awaiting_seed:
+            self._awaiting_seed = False
+            if not self.is_closed:
+                print("[viewer] SEED anulowany — najpierw zamknij pętlę (C).")
+                self._refresh_overlay()
+                return
+            if self.boundary_mask[new_idx]:
+                print("[viewer] SEED na boundary — kliknij dalej od konturu.")
+                self._refresh_overlay()
+                return
+            interior = fill_from_seed(self.graph, self.boundary_mask, new_idx)
+            self.fill_mask = interior
+            print(f"[viewer] SEED fill: {interior.sum()} verts (od klikniętego ziarna).")
+            self._refresh_all()
+            return
+
+        if self.is_closed:
+            print("[viewer] Pętla zamknięta. F=fill, G=seed-fill, X=wyczyść, Z=cofnij.")
+            return
+
+        # Czy klik blisko pierwszego waypointa → zamknij pętlę
+        if len(self.waypoints) >= 3:
+            first = self.waypoints[0]
+            d = float(
+                np.linalg.norm(self.mesh.vertices[new_idx] - self.mesh.vertices[first])
+            )
+            if d < self._close_thresh:
+                self._close_loop()
+                return
+
+        self.waypoints.append(new_idx)
+        if len(self.waypoints) >= 2:
+            seg = shortest_path(self.graph, self.waypoints[-2], new_idx)
+            if seg.size == 0:
+                print("[viewer] Brak ścieżki geodezyjnej między waypointami.")
+                self.waypoints.pop()
+                return
+            self.path_segments.append(seg)
+            self.boundary_mask[seg] = True
+        else:
+            self.boundary_mask[new_idx] = True
+            # fill_mask z auto-load wyczyść — zaczynamy nowy kontur
+            self.fill_mask[:] = False
+
+        self._refresh_all()
+
+    def _close_loop(self) -> None:
+        if self.is_closed:
+            return
+        if len(self.waypoints) < 3:
+            print("[viewer] Potrzeba ≥3 waypointów żeby zamknąć pętlę.")
+            return
+        seg = shortest_path(self.graph, self.waypoints[-1], self.waypoints[0])
+        if seg.size == 0:
+            print("[viewer] Nie udało się znaleźć ścieżki zamykającej pętlę.")
+            return
+        self.path_segments.append(seg)
+        self.boundary_mask[seg] = True
+        self.is_closed = True
+        print("[viewer] Pętla zamknięta. Naciśnij F (lub przycisk FILL) aby wypełnić.")
+        self._refresh_all()
+
+    def _fill(self) -> None:
+        if not self.is_closed:
+            print("[viewer] Najpierw zamknij pętlę (C lub klik blisko 1. waypointa).")
+            return
+        interior = fill_interior(self.graph, self.boundary_mask, prefer="smaller")
+        if not interior.any():
+            print(
+                "[viewer] Wynik pusty. Spróbuj G (seed-fill) — klik wewnątrz pętli."
+            )
+            return
+        self.fill_mask = interior
+        print(f"[viewer] Wypełniono wnętrze: {interior.sum()} verts (auto, smaller).")
+        self._refresh_all()
+
+    def _arm_seed_fill(self) -> None:
+        if not self.is_closed:
+            print("[viewer] SEED dostępny dopiero po zamknięciu pętli (C).")
+            return
+        self._awaiting_seed = True
+        print("[viewer] SEED mode: kliknij punkt WEWNĄTRZ pętli aby wypełnić.")
+        self._refresh_overlay()
+
+    def _invert_fill(self) -> None:
+        if not self.is_closed:
+            return
+        other = fill_interior(self.graph, self.boundary_mask, prefer="larger")
+        self.fill_mask = other
+        print(f"[viewer] Odwrócono: {other.sum()} verts (larger touching).")
+        self._refresh_all()
+
+    def _undo(self) -> None:
+        if self.is_closed:
+            last_seg = self.path_segments.pop()
+            self.boundary_mask[:] = False
+            for seg in self.path_segments:
+                self.boundary_mask[seg] = True
+            for wp in self.waypoints:
+                self.boundary_mask[wp] = True
+            self.is_closed = False
+            self.fill_mask[:] = False
+            print("[viewer] Otwarto pętlę.")
+        elif self.waypoints:
+            self.waypoints.pop()
+            if self.path_segments:
+                self.path_segments.pop()
+            self.boundary_mask[:] = False
+            for seg in self.path_segments:
+                self.boundary_mask[seg] = True
+            for wp in self.waypoints:
+                self.boundary_mask[wp] = True
+            print(f"[viewer] Cofnięto. Zostało {len(self.waypoints)} waypointów.")
+        self._refresh_all()
+
+    def _clear(self) -> None:
+        self.waypoints.clear()
+        self.path_segments.clear()
+        self.boundary_mask[:] = False
+        self.fill_mask[:] = False
+        self.is_closed = False
+        print("[viewer] Wyczyszczono.")
+        self._refresh_all()
+
+    def _save(self) -> None:
+        mask = self._combined_mask()
+        if not mask.any():
+            print("[viewer] Selekcja pusta — nic do zapisu.")
+            return
+        out = save_selection(self.loaded, mask)
+        print(f"[viewer] Zapisano [debug]: {out}  ({mask.sum()} verts)")
+
+    def _reload(self) -> None:
+        m = load_selection(self.loaded)
+        if m is None:
+            print("[viewer] Brak zapisanej selekcji.")
+            return
+        self._clear()
+        self.fill_mask = m
+        print(f"[viewer] Wczytano {m.sum()} verts jako fill (bez konturu).")
+        self._refresh_all()
+
+    # ---------- aligner: generate / export / hide ----------
+    def _generate_aligner(self) -> None:
+        sel = self._combined_mask()
+        if not sel.any():
+            print("[viewer] Najpierw zaznacz powierzchnię (waypointy + F lub G).")
+            return
+        print(f"[viewer] Generuję nakładkę ({sel.sum()} verts selekcji)...")
+        mesh_out, rep = generate_aligner(self.mesh, sel, self.params)
+        if mesh_out is None:
+            print(f"[viewer] Generacja nie powiodła się: {rep.notes}")
+            return
+        self.aligner_mesh = mesh_out
+        self._show_aligner()
+        self._refresh_overlay()
+
+    def _show_aligner(self) -> None:
+        if self.aligner_mesh is None:
+            return
+        if self._aligner_actor is not None:
+            self.plotter.remove_actor(self._aligner_actor, render=False)
+            self._aligner_actor = None
+
+        v = np.asarray(self.aligner_mesh.vertices, dtype=float)
+        f = np.asarray(self.aligner_mesh.faces, dtype=np.int64)
+        faces_flat = np.hstack(
+            [np.full((len(f), 1), 3, dtype=np.int64), f]
+        ).ravel()
+        pv_aligner = pv.PolyData(v, faces_flat)
+        self._aligner_actor = self.plotter.add_mesh(
+            pv_aligner,
+            color=ALIGNER_COLOR,
+            opacity=self._aligner_opacity,
+            smooth_shading=True,
+            specular=0.4,
+            specular_power=15,
+            name="aligner_actor",
+            pickable=False,
+        )
+
+    def _toggle_aligner_visibility(self) -> None:
+        if self._aligner_actor is None:
+            print("[viewer] Brak nakładki — najpierw N (generate).")
+            return
+        vis = self._aligner_actor.GetVisibility()
+        self._aligner_actor.SetVisibility(not vis)
+        self.plotter.render()
+
+    def _export_aligner(self) -> None:
+        if self.aligner_mesh is None:
+            print("[viewer] Brak nakładki do eksportu — najpierw N (generate).")
+            return
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        out = OUTPUT_DIR / f"{self.loaded.stl_path.stem}_aligner.stl"
+        self.aligner_mesh.export(out)
+        print(
+            f"[viewer] Wyeksportowano nakładkę: {out}  "
+            f"({len(self.aligner_mesh.vertices)} verts, "
+            f"watertight={self.aligner_mesh.is_watertight})"
+        )
+
+    # ---------- rendering ----------
+    def _refresh_all(self) -> None:
+        self._refresh_scalars()
+        self._refresh_contour()
+        self._refresh_waypoints()
+        self._refresh_overlay()
+
+    def _refresh_scalars(self) -> None:
+        new_vals = self._combined_mask().astype(np.uint8)
+        if "selected" in self.pv_mesh.point_data:
+            arr = self.pv_mesh.point_data["selected"]
+            if arr.shape == new_vals.shape:
+                arr[:] = new_vals
+                # poinformuj VTK że scalar array się zmienił
+                vtk_arr = self.pv_mesh.GetPointData().GetArray("selected")
+                if vtk_arr is not None:
+                    vtk_arr.Modified()
+            else:
+                self.pv_mesh.point_data["selected"] = new_vals
+        else:
+            self.pv_mesh.point_data["selected"] = new_vals
+        self.plotter.render()
+
+    def _refresh_contour(self) -> None:
+        if self._contour_actor is not None:
+            self.plotter.remove_actor(self._contour_actor, render=False)
+            self._contour_actor = None
+        if not self.path_segments:
+            return
+        all_pts = []
+        line_blocks = []
+        offset = 0
+        for seg in self.path_segments:
+            pts = np.asarray(self.mesh.vertices[seg], dtype=float)
+            n = len(pts)
+            all_pts.append(pts)
+            idx = np.arange(offset, offset + n)
+            line = np.empty(2 * (n - 1) + (n - 1), dtype=np.int64)
+            # pv format: [count, i0, i1, count, i1, i2, ...]
+            line = np.column_stack(
+                [np.full(n - 1, 2), idx[:-1], idx[1:]]
+            ).ravel()
+            line_blocks.append(line)
+            offset += n
+        verts = np.vstack(all_pts)
+        lines = np.concatenate(line_blocks)
+        poly = pv.PolyData(verts, lines=lines)
+        # lift slightly above surface so kontur nie z-fighting
+        normals_per_vertex = self._approx_vertex_normals(verts)
+        verts_lifted = verts + 0.0015 * self._bbox_diag * normals_per_vertex
+        poly.points = verts_lifted
+        self._contour_actor = self.plotter.add_mesh(
+            poly,
+            color=CONTOUR_COLOR,
+            line_width=4,
+            render_lines_as_tubes=False,
+            pickable=False,
+            name="contour_actor",
+        )
+
+    def _approx_vertex_normals(self, points: np.ndarray) -> np.ndarray:
+        """Wyciągnij normalne mesha dla zadanych punktów (po najbliższym vertexie)."""
+        if not hasattr(self.mesh, "vertex_normals"):
+            return np.zeros_like(points)
+        # nearest mesh vertex dla każdego z 'points'
+        from scipy.spatial import cKDTree
+
+        if not hasattr(self, "_kdtree"):
+            self._kdtree = cKDTree(self.mesh.vertices)
+        _, idx = self._kdtree.query(points, k=1)
+        return np.asarray(self.mesh.vertex_normals[idx], dtype=float)
+
+    def _refresh_waypoints(self) -> None:
+        for actor_attr in ("_waypoint_actor", "_first_waypoint_actor"):
+            actor = getattr(self, actor_attr)
+            if actor is not None:
+                self.plotter.remove_actor(actor, render=False)
+                setattr(self, actor_attr, None)
+        if not self.waypoints:
+            return
+        wp_positions = np.asarray(self.mesh.vertices[self.waypoints], dtype=float)
+        # lift waypointy ponad powierzchnię żeby były widoczne
+        lift = 0.002 * self._bbox_diag
+        if hasattr(self.mesh, "vertex_normals"):
+            wp_positions = wp_positions + lift * np.asarray(
+                self.mesh.vertex_normals[self.waypoints], dtype=float
+            )
+
+        # pierwszy waypoint — większy, zielony
+        first_pd = pv.PolyData(wp_positions[:1])
+        first_glyph = first_pd.glyph(
+            geom=pv.Sphere(radius=self._waypoint_radius * 1.6),
+            scale=False,
+            orient=False,
+        )
+        self._first_waypoint_actor = self.plotter.add_mesh(
+            first_glyph,
+            color=FIRST_WAYPOINT_COLOR,
+            pickable=False,
+            name="first_waypoint_actor",
+        )
+
+        if len(wp_positions) > 1:
+            rest_pd = pv.PolyData(wp_positions[1:])
+            rest_glyph = rest_pd.glyph(
+                geom=pv.Sphere(radius=self._waypoint_radius),
+                scale=False,
+                orient=False,
+            )
+            self._waypoint_actor = self.plotter.add_mesh(
+                rest_glyph,
+                color=WAYPOINT_COLOR,
+                pickable=False,
+                name="waypoint_actor",
+            )
+
+    def _refresh_overlay(self) -> None:
+        n_wp = len(self.waypoints)
+        n_sel = int(self._combined_mask().sum())
+        n_tot = len(self.mesh.vertices)
+        status = "CLOSED" if self.is_closed else f"OPEN ({n_wp} pkt)"
+        if self._awaiting_seed:
+            status += "   >>> KLIKNIJ ZIARNO WEWNĄTRZ PĘTLI <<<"
+        aligner_info = ""
+        if self.aligner_mesh is not None:
+            aligner_info = (
+                f"\nNakładka: {len(self.aligner_mesh.vertices)} verts, "
+                f"watertight={self.aligner_mesh.is_watertight}"
+            )
+        text = (
+            f"Plik: {self.loaded.stl_path.name}\n"
+            f"Stan: {status}\n"
+            f"Zaznaczone: {n_sel} / {n_tot}  ({100.0 * n_sel / max(n_tot,1):.1f}%)"
+            f"{aligner_info}\n"
+            f"\n"
+            f"Klik = waypoint  |  klik blisko 1.zielonego = zamknij\n"
+            f"[C] close  [F] fill (auto)  [G] seed-fill  [I] invert\n"
+            f"[Z] undo  [X] clear  [S] save  [L] load\n"
+            f"[N] generate aligner  [E] export STL  [H] hide aligner"
+        )
+        color = "#fde047" if self._awaiting_seed else "#e5e5e5"
+        self.plotter.add_text(
+            text,
+            position="upper_left",
+            font_size=10,
+            color=color,
+            name="status_text",
+        )
+
+    # ---------- entry ----------
+    def run(self) -> None:
+        print(
+            "[viewer] Klikaj waypointy → C (zamknij) → F (fill) → "
+            "N (generate aligner) → E (export STL). Q/Esc kończy."
+        )
+        self.plotter.show()

@@ -1,0 +1,20 @@
+[project]
+name = "aligner-gen"
+version = "0.1.0"
+description = "Dental aligner generator from STL scans"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "trimesh>=4.0",
+    "pyvista>=0.43",
+    "vtk>=9.3",
+    "scikit-image>=0.22",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
