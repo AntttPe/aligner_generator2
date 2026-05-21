@@ -36,8 +36,9 @@ class AlignerParams:
     inner_clearance: float = 0.05       # luz między zębem a wnętrzem nakładki [mm]
     close_radius: float = 1.5           # R closing dla bridgowania embrasur [mm]
     selection_radius: float = 3.0       # max odległość voxela od zaznaczonej powierzchni [mm]
-    use_owner_check: bool = True        # voxel musi być bliżej zaznaczonej części mesha niż niezaznaczonej (naturalny trim na gingival margin)
-    voxel_pitch: float = 0.15           # rozdzielczość siatki voxelowej [mm]
+    use_owner_check: bool = True        # voxel musi być bliżej zaznaczonej części mesha niż niezaznaczonej
+    fillet_radius: float = 0.3          # promień zaokrąglenia krawędzi (trim line + miejsca styku inner/outer/trim) [mm]
+    voxel_pitch: float = 0.10           # rozdzielczość siatki voxelowej [mm] — 0.10 dla direct-print quality
     bbox_padding: float = 5.0           # dodatkowy margines bboxa [mm]
     field_smooth_sigma: float = 0.8     # gauss smoothing field-u przed MC (voxel units)
     fill_holes: bool = True             # trimesh.repair.fill_holes po MC (otwarte krawędzie)
@@ -45,6 +46,20 @@ class AlignerParams:
     taubin_lambda: float = 0.5
     taubin_nu: float = 0.53
     keep_largest_component: bool = True
+
+
+def _smin(a: np.ndarray, b: np.ndarray, k: float) -> np.ndarray:
+    """Polynomial smooth minimum (Iñigo Quilez).
+
+    Gdy `k=0` daje twardy min. Dla `k>0` gładko zaokrągla zbieg dwóch
+    powierzchni iso-zerowych z efektywnym promieniem ≈ k/4.
+
+    https://iquilezles.org/articles/smin/
+    """
+    if k <= 0:
+        return np.minimum(a, b)
+    h = np.maximum(k - np.abs(a - b), 0.0) / k
+    return np.minimum(a, b) - h * h * k * 0.25
 
 
 @dataclass
@@ -155,22 +170,28 @@ def generate_aligner(
         f"{int(owner.sum())} ({rep.sel_distance_seconds:.1f}s)"
     )
 
-    # ---- TSDF-like field aligner ----
+    # ---- TSDF-like field aligner z smooth-min (fillet na krawędziach) ----
     inner_iso = params.inner_clearance
     outer_iso = params.inner_clearance + params.thickness
-    aligner_field_data = np.minimum.reduce(
-        [
-            sdf.data - inner_iso,                       # ≥0 gdy na zewnątrz wnętrza
-            outer_iso - sdf.data,                       # ≥0 gdy wewnątrz zewnętrza
-            params.selection_radius - sel_dist_data,    # ≥0 gdy w zasięgu selekcji
-        ]
-    ).astype(np.float32)
+    k = params.fillet_radius
 
-    # ---- owner check: voxel musi być bliżej selected niż unselected powierzchni ----
+    # smooth-min między 3 warunkami iso-pola:
+    # inner surface (sdf=inner_iso), outer surface (sdf=outer_iso), trim (sel_dist=sel_radius)
+    aligner_field_data = _smin(
+        sdf.data - inner_iso, outer_iso - sdf.data, k
+    )
+    aligner_field_data = _smin(
+        aligner_field_data, params.selection_radius - sel_dist_data, k
+    )
+
+    # owner check jako signed-distance (gradient, NIE binary cutoff) — to daje
+    # gładki, zaokrąglony brzeg nakładki przy gingival margin zamiast ostrego cięcia
     if params.use_owner_check:
-        aligner_field_data = np.where(
-            owner, aligner_field_data, np.float32(-1.0)
-        ).astype(np.float32)
+        dist_in = ndi.distance_transform_edt(owner).astype(np.float32) * sdf.pitch
+        dist_out = ndi.distance_transform_edt(~owner).astype(np.float32) * sdf.pitch
+        owner_signed = dist_in - dist_out  # >0 wewnątrz owner, <0 poza
+        aligner_field_data = _smin(aligner_field_data, owner_signed, k)
+    aligner_field_data = aligner_field_data.astype(np.float32)
 
     n_aligner_voxels = int((aligner_field_data > 0).sum())
     rep.aligner_voxels = n_aligner_voxels

@@ -65,6 +65,9 @@ class SelectionViewer:
         self._aligner_actor = None
         self._aligner_opacity = 0.85
         self.params = AlignerParams()
+        # quality mode: "preview" = pitch 0.20 (~12s), "final" = pitch 0.10 (~90s)
+        self._quality_mode = "final"  # zaczynamy od final bo direct-print
+        self.params.voxel_pitch = 0.10
 
         # geometry / threshold scale
         bbox = self.mesh.bounds
@@ -95,7 +98,7 @@ class SelectionViewer:
         self.plotter.set_background("#1a1a1a")
         self.plotter.add_axes()
 
-        self.plotter.add_mesh(
+        self._mesh_actor = self.plotter.add_mesh(
             self.pv_mesh,
             scalars="selected",
             cmap=SCALAR_CMAP,
@@ -114,6 +117,7 @@ class SelectionViewer:
         self._setup_picking()
         self._setup_keys()
         self._setup_buttons()
+        self._setup_sliders()
         self._refresh_all()
 
     # ---------- maski ----------
@@ -151,6 +155,8 @@ class SelectionViewer:
         self.plotter.add_key_event("n", self._generate_aligner)
         self.plotter.add_key_event("e", self._export_aligner)
         self.plotter.add_key_event("h", self._toggle_aligner_visibility)
+        self.plotter.add_key_event("m", self._toggle_mesh_visibility)
+        self.plotter.add_key_event("p", self._toggle_quality_mode)
 
     def _setup_buttons(self) -> None:
         """Klikalne buttony — duplikat hotkeyów dla wygody.
@@ -168,7 +174,9 @@ class SelectionViewer:
             ("LOAD [L]",      self._reload,                  "#a78bfa",  700),
             ("GENERATE [N]",  self._generate_aligner,        "#f97316",  810),
             ("EXPORT [E]",    self._export_aligner,          "#10b981",  960),
-            ("HIDE [H]",      self._toggle_aligner_visibility, "#64748b", 1090),
+            ("ALIGNER [H]",   self._toggle_aligner_visibility, "#64748b", 1090),
+            ("TEETH [M]",     self._toggle_mesh_visibility,    "#a3a3a3", 1230),
+            ("QUALITY [P]",   self._toggle_quality_mode,       "#ec4899", 1340),
         ]
         y = 16
         for label, cb, color, x in specs:
@@ -195,6 +203,65 @@ class SelectionViewer:
         def _inner(_value):
             cb()
         return _inner
+
+    def _setup_sliders(self) -> None:
+        """Slidery dla najważniejszych parametrów. Wartość self.params jest
+        aktualizowana na żywo, ale regeneracja wymaga naciśnięcia N (slider
+        nie triggeruje 25s pipelineu sam z siebie)."""
+        # Offset / inner_clearance: 0.05–0.30 mm (visible przy pitch 0.15mm)
+        self.plotter.add_slider_widget(
+            callback=self._on_clearance_change,
+            rng=(0.05, 0.30),
+            value=max(0.05, min(self.params.inner_clearance, 0.30)),
+            title="Offset od zebow [mm]",
+            pointa=(0.72, 0.94),
+            pointb=(0.98, 0.94),
+            style="modern",
+            fmt="%.3f",
+            title_height=0.018,
+            slider_width=0.025,
+            tube_width=0.005,
+        )
+        # Grubość / thickness: 0.5–1.5 mm
+        self.plotter.add_slider_widget(
+            callback=self._on_thickness_change,
+            rng=(0.5, 1.5),
+            value=self.params.thickness,
+            title="Grubosc nakladki [mm]",
+            pointa=(0.72, 0.82),
+            pointb=(0.98, 0.82),
+            style="modern",
+            fmt="%.2f",
+            title_height=0.018,
+            slider_width=0.025,
+            tube_width=0.005,
+        )
+        # Fillet radius — zaokrąglenie krawędzi: 0.0–0.8 mm
+        self.plotter.add_slider_widget(
+            callback=self._on_fillet_change,
+            rng=(0.0, 0.8),
+            value=self.params.fillet_radius,
+            title="Zaokraglenie krawedzi [mm]",
+            pointa=(0.72, 0.70),
+            pointb=(0.98, 0.70),
+            style="modern",
+            fmt="%.2f",
+            title_height=0.018,
+            slider_width=0.025,
+            tube_width=0.005,
+        )
+
+    def _on_clearance_change(self, value: float) -> None:
+        self.params.inner_clearance = float(value)
+        self._refresh_overlay()
+
+    def _on_thickness_change(self, value: float) -> None:
+        self.params.thickness = float(value)
+        self._refresh_overlay()
+
+    def _on_fillet_change(self, value: float) -> None:
+        self.params.fillet_radius = float(value)
+        self._refresh_overlay()
 
     # ---------- callbacks ----------
     def _on_pick(self, point, *_args, **_kwargs) -> None:
@@ -247,8 +314,9 @@ class SelectionViewer:
             self.boundary_mask[seg] = True
         else:
             self.boundary_mask[new_idx] = True
-            # fill_mask z auto-load wyczyść — zaczynamy nowy kontur
-            self.fill_mask[:] = False
+            # NIE czyścimy fill_mask — żeby przypadkowy klik nie zniszczył
+            # auto-loadowanej selekcji. _fill (F) i tak zastąpi fill_mask
+            # nowym wnętrzem konturu, X jawnie czyści wszystko.
 
         self._refresh_all()
 
@@ -393,7 +461,34 @@ class SelectionViewer:
             return
         vis = self._aligner_actor.GetVisibility()
         self._aligner_actor.SetVisibility(not vis)
+        print(f"[viewer] Nakładka {'widoczna' if not vis else 'ukryta'}.")
         self.plotter.render()
+
+    def _toggle_mesh_visibility(self) -> None:
+        """Chowa/pokazuje główny mesh zębów (do inspekcji wnętrza nakładki)."""
+        if self._mesh_actor is None:
+            return
+        vis = self._mesh_actor.GetVisibility()
+        self._mesh_actor.SetVisibility(not vis)
+        print(f"[viewer] Mesh zębów {'widoczny' if not vis else 'ukryty'}.")
+        self.plotter.render()
+
+    def _toggle_quality_mode(self) -> None:
+        """Toggle PREVIEW (pitch 0.20, ~12s) ↔ FINAL (pitch 0.10, ~90s).
+
+        PREVIEW do szybkiej iteracji parametrów, FINAL przed exportem STL
+        do druku. Direct-print Formlabs/Asiga wymaga FINAL dla pełnej
+        precyzji ~50µm.
+        """
+        if self._quality_mode == "final":
+            self._quality_mode = "preview"
+            self.params.voxel_pitch = 0.20
+            print("[viewer] Quality: PREVIEW (pitch=0.20mm, ~12s/N)")
+        else:
+            self._quality_mode = "final"
+            self.params.voxel_pitch = 0.10
+            print("[viewer] Quality: FINAL (pitch=0.10mm, ~90s/N) — do druku 3D")
+        self._refresh_overlay()
 
     def _export_aligner(self) -> None:
         if self.aligner_mesh is None:
@@ -537,16 +632,23 @@ class SelectionViewer:
                 f"\nNakładka: {len(self.aligner_mesh.vertices)} verts, "
                 f"watertight={self.aligner_mesh.is_watertight}"
             )
+        params_info = (
+            f"\nParams: offset={self.params.inner_clearance:.3f}mm  "
+            f"grubosc={self.params.thickness:.2f}mm  "
+            f"fillet={self.params.fillet_radius:.2f}mm\n"
+            f"        quality={self._quality_mode.upper()} (pitch={self.params.voxel_pitch:.2f})"
+        )
         text = (
             f"Plik: {self.loaded.stl_path.name}\n"
             f"Stan: {status}\n"
             f"Zaznaczone: {n_sel} / {n_tot}  ({100.0 * n_sel / max(n_tot,1):.1f}%)"
-            f"{aligner_info}\n"
+            f"{aligner_info}"
+            f"{params_info}\n"
             f"\n"
             f"Klik = waypoint  |  klik blisko 1.zielonego = zamknij\n"
             f"[C] close  [F] fill (auto)  [G] seed-fill  [I] invert\n"
             f"[Z] undo  [X] clear  [S] save  [L] load\n"
-            f"[N] generate aligner  [E] export STL  [H] hide aligner"
+            f"[N] generate  [E] export STL  [P] preview/final  [H] aligner  [M] teeth"
         )
         color = "#fde047" if self._awaiting_seed else "#e5e5e5"
         self.plotter.add_text(
