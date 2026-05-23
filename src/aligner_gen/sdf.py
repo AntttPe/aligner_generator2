@@ -60,6 +60,18 @@ def voxelize_solid(
     ("outside teeth"). Bez tego closing był ucinany przy granicy gridu
     i nakładka miała dziury na cusp tops.
     """
+    # Memory guard: trimesh voxelizuje CAŁY mesh. Jeśli bbox mesha jest
+    # absurdalnie duży (outlier vertex daleko od modelu), grid eksploduje
+    # i proces zostaje zabity przez OOM. Lepiej jasny błąd.
+    full_extent = mesh.bounds[1] - mesh.bounds[0]
+    full_voxels = float(np.prod(np.ceil(full_extent / pitch)))
+    if full_voxels > 3e9:
+        raise MemoryError(
+            f"Voxelizacja calego mesha = {full_voxels / 1e9:.1f}G voxeli "
+            f"(bbox {np.round(full_extent, 1)} mm). Prawdopodobnie outlier "
+            f"daleko od modelu. Sprawdz/napraw STL."
+        )
+
     vg = mesh.voxelized(pitch=pitch)
     vg = vg.fill(method="holes")
     full = vg.matrix

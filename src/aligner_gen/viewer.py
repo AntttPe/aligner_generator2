@@ -27,6 +27,12 @@ from pathlib import Path
 import trimesh
 
 from .aligner import AlignerParams, generate_aligner
+from .curvature import (
+    build_snap_graph,
+    compute_edge_ridge_scores,
+    denoise_ridge,
+    vertex_ridge_scores,
+)
 from .io import LoadedMesh, load_selection, save_selection
 from .selection import (
     build_edge_graph,
@@ -59,6 +65,16 @@ class SelectionViewer:
         self.fill_mask = np.zeros(len(self.mesh.vertices), dtype=bool)
         self.is_closed = False
         self._awaiting_seed = False  # po G — następny klik to ziarno fillu
+
+        # live-wire / trim mode: "manual" (geodesic) | "scalloped" (snap do margin)
+        self.trim_mode = "manual"
+        self._snap_graph = None        # lazy — curvature-weighted graph
+        self._edge_ridge = None        # per-edge ridge scores PO denoise (cache)
+        self._curvature_view = False   # heatmapa krzywizny ON/OFF
+        # parametry live-wire (tunable — [ ] zmieniają próg kąta, ; ' rozmiar komponentu)
+        self._angle_threshold = 0.14   # próg kąta dwuściennego [rad] (~8°) dla silnego ridge
+        self._min_comp_edges = 25      # min krawędzi w spójnym komponencie (denoise)
+        self._snap_strength = 25.0     # jak mocno snap przyciąga do margin
 
         # aligner state
         self.aligner_mesh: trimesh.Trimesh | None = None
@@ -108,6 +124,7 @@ class SelectionViewer:
             interpolate_before_map=True,
             specular=0.25,
             specular_power=12,
+            name="mesh_actor",
         )
 
         self._contour_actor = None
@@ -157,6 +174,13 @@ class SelectionViewer:
         self.plotter.add_key_event("h", self._toggle_aligner_visibility)
         self.plotter.add_key_event("m", self._toggle_mesh_visibility)
         self.plotter.add_key_event("p", self._toggle_quality_mode)
+        self.plotter.add_key_event("w", self._toggle_trim_mode)
+        self.plotter.add_key_event("v", self._toggle_curvature_view)
+        # live-tuning denoise (z włączoną heatmapą V widać efekt od razu)
+        self.plotter.add_key_event("bracketleft", lambda: self._adjust_angle_threshold(-2))
+        self.plotter.add_key_event("bracketright", lambda: self._adjust_angle_threshold(+2))
+        self.plotter.add_key_event("semicolon", lambda: self._adjust_min_comp(-10))
+        self.plotter.add_key_event("apostrophe", lambda: self._adjust_min_comp(+10))
 
     def _setup_buttons(self) -> None:
         """Klikalne buttony — duplikat hotkeyów dla wygody.
@@ -177,6 +201,8 @@ class SelectionViewer:
             ("ALIGNER [H]",   self._toggle_aligner_visibility, "#64748b", 1090),
             ("TEETH [M]",     self._toggle_mesh_visibility,    "#a3a3a3", 1230),
             ("QUALITY [P]",   self._toggle_quality_mode,       "#ec4899", 1340),
+            ("TRIM [W]",      self._toggle_trim_mode,          "#14b8a6", 1450),
+            ("CURV [V]",      self._toggle_curvature_view,     "#eab308", 1560),
         ]
         y = 16
         for label, cb, color, x in specs:
@@ -236,16 +262,30 @@ class SelectionViewer:
             slider_width=0.025,
             tube_width=0.005,
         )
-        # Fillet radius — zaokrąglenie krawędzi: 0.0–0.8 mm
+        # Fillet radius — zaokrąglenie krawędzi: 0.0–1.5 mm
         self.plotter.add_slider_widget(
             callback=self._on_fillet_change,
-            rng=(0.0, 0.8),
+            rng=(0.0, 1.5),
             value=self.params.fillet_radius,
             title="Zaokraglenie krawedzi [mm]",
             pointa=(0.72, 0.70),
             pointb=(0.98, 0.70),
             style="modern",
             fmt="%.2f",
+            title_height=0.018,
+            slider_width=0.025,
+            tube_width=0.005,
+        )
+        # Trim smoothing — gładkość przebiegu krawędzi: 0–12 voxeli
+        self.plotter.add_slider_widget(
+            callback=self._on_trim_smooth_change,
+            rng=(0.0, 12.0),
+            value=self.params.trim_smooth_sigma,
+            title="Gladkosc krawedzi (trim)",
+            pointa=(0.72, 0.58),
+            pointb=(0.98, 0.58),
+            style="modern",
+            fmt="%.1f",
             title_height=0.018,
             slider_width=0.025,
             tube_width=0.005,
@@ -261,6 +301,10 @@ class SelectionViewer:
 
     def _on_fillet_change(self, value: float) -> None:
         self.params.fillet_radius = float(value)
+        self._refresh_overlay()
+
+    def _on_trim_smooth_change(self, value: float) -> None:
+        self.params.trim_smooth_sigma = float(value)
         self._refresh_overlay()
 
     # ---------- callbacks ----------
@@ -305,9 +349,9 @@ class SelectionViewer:
 
         self.waypoints.append(new_idx)
         if len(self.waypoints) >= 2:
-            seg = shortest_path(self.graph, self.waypoints[-2], new_idx)
+            seg = shortest_path(self._path_graph(), self.waypoints[-2], new_idx)
             if seg.size == 0:
-                print("[viewer] Brak ścieżki geodezyjnej między waypointami.")
+                print("[viewer] Brak ścieżki między waypointami.")
                 self.waypoints.pop()
                 return
             self.path_segments.append(seg)
@@ -326,7 +370,7 @@ class SelectionViewer:
         if len(self.waypoints) < 3:
             print("[viewer] Potrzeba ≥3 waypointów żeby zamknąć pętlę.")
             return
-        seg = shortest_path(self.graph, self.waypoints[-1], self.waypoints[0])
+        seg = shortest_path(self._path_graph(), self.waypoints[-1], self.waypoints[0])
         if seg.size == 0:
             print("[viewer] Nie udało się znaleźć ścieżki zamykającej pętlę.")
             return
@@ -357,6 +401,129 @@ class SelectionViewer:
         self._awaiting_seed = True
         print("[viewer] SEED mode: kliknij punkt WEWNĄTRZ pętli aby wypełnić.")
         self._refresh_overlay()
+
+    # ---------- live-wire (curvature snap) ----------
+    def _ensure_ridge(self):
+        """Lazy compute denoised ridge (raz). Używane przez heatmapę i snap."""
+        if self._edge_ridge is None:
+            import numpy as _np
+            print(
+                f"[viewer] Liczę krzywiznę: angle_threshold={self._angle_threshold:.3f}rad "
+                f"({_np.degrees(self._angle_threshold):.1f}°), "
+                f"min_comp_edges={self._min_comp_edges}, snap_strength={self._snap_strength}"
+            )
+            raw = compute_edge_ridge_scores(self.mesh)
+            print(
+                f"[curvature] raw ridge: {np.count_nonzero(raw)} concave edges "
+                f"(z {len(raw)} total), max={raw.max():.3f}rad"
+            )
+            self._edge_ridge = denoise_ridge(
+                self.mesh,
+                raw,
+                angle_threshold=self._angle_threshold,
+                min_component_edges=self._min_comp_edges,
+            )
+        return self._edge_ridge
+
+    def _ensure_snap_graph(self):
+        """Lazy build snap graph z denoised ridge."""
+        if self._snap_graph is None:
+            ridge = self._ensure_ridge()
+            self._snap_graph = build_snap_graph(
+                self.mesh, ridge, strength=self._snap_strength
+            )
+        return self._snap_graph
+
+    def _path_graph(self):
+        """Graf do rysowania ścieżki konturu: snap (scalloped) lub geodesic (manual)."""
+        if self.trim_mode == "scalloped":
+            return self._ensure_snap_graph()
+        return self.graph
+
+    def _invalidate_ridge(self) -> None:
+        """Wyrzuć cache ridge/snap — wymusi przeliczenie z nowymi parametrami."""
+        self._edge_ridge = None
+        self._snap_graph = None
+
+    def _recompute_and_show_ridge(self) -> None:
+        """Przelicz ridge i odśwież heatmapę jeśli włączona."""
+        self._invalidate_ridge()
+        ridge = self._ensure_ridge()
+        if self._curvature_view:
+            vr = vertex_ridge_scores(self.mesh, ridge)
+            self.pv_mesh.point_data["ridge"] = vr.astype(np.float32)
+            self._rebuild_mesh_actor(scalars="ridge")
+            self.plotter.render()
+
+    def _adjust_angle_threshold(self, delta_deg: float) -> None:
+        delta_rad = np.radians(delta_deg)
+        self._angle_threshold = float(np.clip(self._angle_threshold + delta_rad, 0.02, 0.7))
+        print(
+            f"[viewer] angle_threshold = {self._angle_threshold:.3f}rad "
+            f"({np.degrees(self._angle_threshold):.1f}°) — niżej = więcej krawędzi"
+        )
+        self._recompute_and_show_ridge()
+
+    def _adjust_min_comp(self, delta: int) -> None:
+        self._min_comp_edges = int(max(1, self._min_comp_edges + delta))
+        print(f"[viewer] min_comp_edges = {self._min_comp_edges} (wyżej = mniej szumu)")
+        self._recompute_and_show_ridge()
+
+    def _toggle_trim_mode(self) -> None:
+        if self.trim_mode == "manual":
+            self.trim_mode = "scalloped"
+            self._ensure_snap_graph()
+            print(
+                "[viewer] TRIM: SCALLOPED (live-wire) — kliki snap-ują do "
+                "gingival margin (girlanda). Klikaj zgrubne kotwice."
+            )
+        else:
+            self.trim_mode = "manual"
+            print("[viewer] TRIM: MANUAL — geodesic prosto między waypointami.")
+        self._refresh_overlay()
+
+    def _toggle_curvature_view(self) -> None:
+        """Heatmapa krzywizny (ridge score) na meshu — podgląd gdzie snap przyciąga."""
+        self._curvature_view = not self._curvature_view
+        if self._curvature_view:
+            ridge = self._ensure_ridge()
+            vr = vertex_ridge_scores(self.mesh, ridge)
+            self.pv_mesh.point_data["ridge"] = vr.astype(np.float32)
+            self._rebuild_mesh_actor(scalars="ridge")
+            print("[viewer] Heatmapa krzywizny ON (żółte = gingival margin / valley).")
+        else:
+            self._rebuild_mesh_actor(scalars="selected")
+            print("[viewer] Heatmapa krzywizny OFF.")
+        self.plotter.render()
+
+    def _rebuild_mesh_actor(self, scalars: str) -> None:
+        """Przebuduj actor mesha z innym scalarem (selected ↔ ridge)."""
+        if self._mesh_actor is not None:
+            self.plotter.remove_actor(self._mesh_actor, render=False)
+        if scalars == "ridge":
+            self._mesh_actor = self.plotter.add_mesh(
+                self.pv_mesh,
+                scalars="ridge",
+                cmap="viridis",
+                show_scalar_bar=False,
+                smooth_shading=True,
+                name="mesh_actor",
+                reset_camera=False,
+            )
+        else:
+            self._mesh_actor = self.plotter.add_mesh(
+                self.pv_mesh,
+                scalars="selected",
+                cmap=SCALAR_CMAP,
+                clim=(0, 1),
+                show_scalar_bar=False,
+                smooth_shading=True,
+                interpolate_before_map=True,
+                specular=0.25,
+                specular_power=12,
+                name="mesh_actor",
+                reset_camera=False,
+            )
 
     def _invert_fill(self) -> None:
         if not self.is_closed:
@@ -419,10 +586,17 @@ class SelectionViewer:
     # ---------- aligner: generate / export / hide ----------
     def _generate_aligner(self) -> None:
         sel = self._combined_mask()
+        n_sel = int(sel.sum())
         if not sel.any():
             print("[viewer] Najpierw zaznacz powierzchnię (waypointy + F lub G).")
             return
-        print(f"[viewer] Generuję nakładkę ({sel.sum()} verts selekcji)...")
+        if n_sel < 5000:
+            print(
+                f"[viewer] UWAGA: selekcja tylko {n_sel} verts — to bardzo mało, "
+                f"nakładka będzie malutka/niewidoczna. Czy na pewno? "
+                f"(L=wczytaj zapisaną pełną selekcję, F=wypełnij narysowaną pętlę)"
+            )
+        print(f"[viewer] Generuję nakładkę ({n_sel} verts selekcji)...")
         mesh_out, rep = generate_aligner(self.mesh, sel, self.params)
         if mesh_out is None:
             print(f"[viewer] Generacja nie powiodła się: {rep.notes}")
@@ -453,6 +627,7 @@ class SelectionViewer:
             specular_power=15,
             name="aligner_actor",
             pickable=False,
+            reset_camera=False,
         )
 
     def _toggle_aligner_visibility(self) -> None:
@@ -561,6 +736,7 @@ class SelectionViewer:
             render_lines_as_tubes=False,
             pickable=False,
             name="contour_actor",
+            reset_camera=False,
         )
 
     def _approx_vertex_normals(self, points: np.ndarray) -> np.ndarray:
@@ -603,6 +779,7 @@ class SelectionViewer:
             color=FIRST_WAYPOINT_COLOR,
             pickable=False,
             name="first_waypoint_actor",
+            reset_camera=False,
         )
 
         if len(wp_positions) > 1:
@@ -617,6 +794,7 @@ class SelectionViewer:
                 color=WAYPOINT_COLOR,
                 pickable=False,
                 name="waypoint_actor",
+                reset_camera=False,
             )
 
     def _refresh_overlay(self) -> None:
@@ -624,6 +802,7 @@ class SelectionViewer:
         n_sel = int(self._combined_mask().sum())
         n_tot = len(self.mesh.vertices)
         status = "CLOSED" if self.is_closed else f"OPEN ({n_wp} pkt)"
+        status += f"   |   TRIM: {self.trim_mode.upper()}"
         if self._awaiting_seed:
             status += "   >>> KLIKNIJ ZIARNO WEWNĄTRZ PĘTLI <<<"
         aligner_info = ""
@@ -635,7 +814,8 @@ class SelectionViewer:
         params_info = (
             f"\nParams: offset={self.params.inner_clearance:.3f}mm  "
             f"grubosc={self.params.thickness:.2f}mm  "
-            f"fillet={self.params.fillet_radius:.2f}mm\n"
+            f"fillet={self.params.fillet_radius:.2f}mm  "
+            f"trim_smooth={self.params.trim_smooth_sigma:.1f}\n"
             f"        quality={self._quality_mode.upper()} (pitch={self.params.voxel_pitch:.2f})"
         )
         text = (
@@ -647,6 +827,7 @@ class SelectionViewer:
             f"\n"
             f"Klik = waypoint  |  klik blisko 1.zielonego = zamknij\n"
             f"[C] close  [F] fill (auto)  [G] seed-fill  [I] invert\n"
+            f"[W] trim manual/scalloped  [V] heatmapa  [ ] prog ridge  ; ' rozmiar\n"
             f"[Z] undo  [X] clear  [S] save  [L] load\n"
             f"[N] generate  [E] export STL  [P] preview/final  [H] aligner  [M] teeth"
         )

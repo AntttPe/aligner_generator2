@@ -37,12 +37,13 @@ class AlignerParams:
     close_radius: float = 1.5           # R closing dla bridgowania embrasur [mm]
     selection_radius: float = 3.0       # max odległość voxela od zaznaczonej powierzchni [mm]
     use_owner_check: bool = True        # voxel musi być bliżej zaznaczonej części mesha niż niezaznaczonej
-    fillet_radius: float = 0.3          # promień zaokrąglenia krawędzi (trim line + miejsca styku inner/outer/trim) [mm]
+    fillet_radius: float = 0.6          # zaokrąglenie krawędzi trim/owner (smooth-min k) [mm]
+    trim_smooth_sigma: float = 5.0      # gauss na polach trim (owner/sel_dist) [voxele] — wygładza PRZEBIEG krawędzi (frędzle). NIE rusza sdf → fit inner surface zachowany
     voxel_pitch: float = 0.10           # rozdzielczość siatki voxelowej [mm] — 0.10 dla direct-print quality
     bbox_padding: float = 5.0           # dodatkowy margines bboxa [mm]
-    field_smooth_sigma: float = 0.8     # gauss smoothing field-u przed MC (voxel units)
+    field_smooth_sigma: float = 1.0     # gauss smoothing field-u przed MC (voxel units)
     fill_holes: bool = True             # trimesh.repair.fill_holes po MC (otwarte krawędzie)
-    taubin_iters: int = 8               # Taubin smoothing wynikowego mesha (volume-preserving)
+    taubin_iters: int = 15              # Taubin smoothing wynikowego mesha (volume-preserving)
     taubin_lambda: float = 0.5
     taubin_nu: float = 0.53
     keep_largest_component: bool = True
@@ -120,7 +121,12 @@ def generate_aligner(
     # ---- voxelizacja ----
     t = time.time()
     print(f"[aligner] voxelizuję (pitch={params.voxel_pitch} mm)...")
-    binary = voxelize_solid(mesh, bbox_min, bbox_max, params.voxel_pitch)
+    try:
+        binary = voxelize_solid(mesh, bbox_min, bbox_max, params.voxel_pitch)
+    except MemoryError as e:
+        rep.notes.append(str(e))
+        print(f"[aligner] ABORT: {e}")
+        return None, rep
     rep.voxelize_seconds = time.time() - t
     rep.grid_shape = tuple(binary.shape)
     inside_count = int(binary.data.sum())
@@ -175,21 +181,37 @@ def generate_aligner(
     outer_iso = params.inner_clearance + params.thickness
     k = params.fillet_radius
 
-    # smooth-min między 3 warunkami iso-pola:
-    # inner surface (sdf=inner_iso), outer surface (sdf=outer_iso), trim (sel_dist=sel_radius)
-    aligner_field_data = _smin(
-        sdf.data - inner_iso, outer_iso - sdf.data, k
-    )
-    aligner_field_data = _smin(
-        aligner_field_data, params.selection_radius - sel_dist_data, k
-    )
+    # Grubość ścianki (inner vs outer) — TWARDY min, żeby fillet NIE
+    # ścieńczał ścianki (smin na tej parze przewęża środek ścianki do zera).
+    wall = np.minimum(sdf.data - inner_iso, outer_iso - sdf.data)
 
-    # owner check jako signed-distance (gradient, NIE binary cutoff) — to daje
-    # gładki, zaokrąglony brzeg nakładki przy gingival margin zamiast ostrego cięcia
+    # --- pola definiujące TRIM (krawędź przy dziąśle) ---
+    sel_field = params.selection_radius - sel_dist_data
     if params.use_owner_check:
         dist_in = ndi.distance_transform_edt(owner).astype(np.float32) * sdf.pitch
         dist_out = ndi.distance_transform_edt(~owner).astype(np.float32) * sdf.pitch
-        owner_signed = dist_in - dist_out  # >0 wewnątrz owner, <0 poza
+        owner_signed = (dist_in - dist_out).astype(np.float32)  # >0 wewn. owner
+    else:
+        owner_signed = None
+
+    # Wygładź PRZEBIEG krawędzi: gauss na polach trim. To likwiduje frędzle
+    # (jagged trim kopiujący ręczny kontur), a NIE rusza sdf → fit inner
+    # surface zostaje precyzyjny.
+    if params.trim_smooth_sigma > 0:
+        t = time.time()
+        sel_field = ndi.gaussian_filter(sel_field, sigma=params.trim_smooth_sigma)
+        if owner_signed is not None:
+            owner_signed = ndi.gaussian_filter(
+                owner_signed, sigma=params.trim_smooth_sigma
+            )
+        print(
+            f"[aligner]   trim smoothing σ={params.trim_smooth_sigma} voxeli "
+            f"({time.time() - t:.1f}s)"
+        )
+
+    # Fillet (smooth-min) TYLKO na otwartych krawędziach: trim + owner cut.
+    aligner_field_data = _smin(wall, sel_field, k)
+    if owner_signed is not None:
         aligner_field_data = _smin(aligner_field_data, owner_signed, k)
     aligner_field_data = aligner_field_data.astype(np.float32)
 
