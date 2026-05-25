@@ -75,6 +75,11 @@ class SelectionViewer:
         self._angle_threshold = 0.14   # próg kąta dwuściennego [rad] (~8°) dla silnego ridge
         self._min_comp_edges = 25      # min krawędzi w spójnym komponencie (denoise)
         self._snap_strength = 25.0     # jak mocno snap przyciąga do margin
+        # auto-trace (Etap 1): snap klikniętego waypointa do najbliższego
+        # wierzchołka margin — pozwala klikać z grubsza, punkt sam ląduje na linii.
+        self._ridge_kdtree = None      # lazy cKDTree pozycji wierzchołków ridge
+        self._ridge_vert_idx = None    # indeksy wierzchołków z ridge>0
+        self._snap_radius = 3.0        # [mm] max odległość snapu waypointa do margin
 
         # aligner state
         self.aligner_mesh: trimesh.Trimesh | None = None
@@ -337,6 +342,9 @@ class SelectionViewer:
             print("[viewer] Pętla zamknięta. F=fill, G=seed-fill, X=wyczyść, Z=cofnij.")
             return
 
+        # auto-trace (Etap 1): w scalloped waypoint sam ląduje na margin
+        new_idx = self._snap_to_ridge(new_idx)
+
         # Czy klik blisko pierwszego waypointa → zamknij pętlę
         if len(self.waypoints) >= 3:
             first = self.waypoints[0]
@@ -377,8 +385,9 @@ class SelectionViewer:
         self.path_segments.append(seg)
         self.boundary_mask[seg] = True
         self.is_closed = True
-        print("[viewer] Pętla zamknięta. Naciśnij F (lub przycisk FILL) aby wypełnić.")
+        print("[viewer] Pętla zamknięta — auto-fill wnętrza...")
         self._refresh_all()
+        self._fill()  # auto-fill (Etap 1) — bez ręcznego F; jak pusto, info o G
 
     def _fill(self) -> None:
         if not self.is_closed:
@@ -440,10 +449,42 @@ class SelectionViewer:
             return self._ensure_snap_graph()
         return self.graph
 
+    def _ensure_ridge_kdtree(self):
+        """Lazy cKDTree wierzchołków margin (ridge>0) do snapu waypointów."""
+        if self._ridge_kdtree is None:
+            from scipy.spatial import cKDTree
+
+            ridge = self._ensure_ridge()
+            vr = vertex_ridge_scores(self.mesh, ridge)
+            self._ridge_vert_idx = np.where(vr > 0)[0]
+            if self._ridge_vert_idx.size > 0:
+                self._ridge_kdtree = cKDTree(self.mesh.vertices[self._ridge_vert_idx])
+        return self._ridge_kdtree
+
+    def _snap_to_ridge(self, idx: int) -> int:
+        """Scalloped: przyciągnij kliknięty wierzchołek do najbliższego punktu
+        margin (ridge>0) w promieniu `_snap_radius`. Pozwala klikać z grubsza —
+        waypoint sam ląduje na linii zębodołowej. W manual: bez zmian."""
+        if self.trim_mode != "scalloped":
+            return idx
+        tree = self._ensure_ridge_kdtree()
+        if tree is None:
+            return idx
+        d, j = tree.query(self.mesh.vertices[idx])
+        if d <= self._snap_radius:
+            return int(self._ridge_vert_idx[j])
+        print(
+            f"[viewer] snap: brak margin w {self._snap_radius:.1f}mm "
+            f"(najbliższy {d:.1f}mm) — waypoint bez snapu, klik bliżej linii."
+        )
+        return idx
+
     def _invalidate_ridge(self) -> None:
         """Wyrzuć cache ridge/snap — wymusi przeliczenie z nowymi parametrami."""
         self._edge_ridge = None
         self._snap_graph = None
+        self._ridge_kdtree = None
+        self._ridge_vert_idx = None
 
     def _recompute_and_show_ridge(self) -> None:
         """Przelicz ridge i odśwież heatmapę jeśli włączona."""
@@ -474,8 +515,9 @@ class SelectionViewer:
             self.trim_mode = "scalloped"
             self._ensure_snap_graph()
             print(
-                "[viewer] TRIM: SCALLOPED (live-wire) — kliki snap-ują do "
-                "gingival margin (girlanda). Klikaj zgrubne kotwice."
+                "[viewer] TRIM: SCALLOPED (auto-trace) — waypoint I ścieżka "
+                "snap-ują do gingival margin. Klikaj ~5 zgrubnych kotwic wokół "
+                f"łuku → C zamyka → auto-fill. Snap waypointa w {self._snap_radius:.0f}mm."
             )
         else:
             self.trim_mode = "manual"
@@ -501,10 +543,18 @@ class SelectionViewer:
         if self._mesh_actor is not None:
             self.plotter.remove_actor(self._mesh_actor, render=False)
         if scalars == "ridge":
+            # Heatmapa: tło neutralne (białawe) → granica (margin) dobija do
+            # czerwonego. clim od 0 do wysokiego percentyla nonzero, żeby margin
+            # realnie saturował na czerwono (a nie tylko pojedyncza najsilniejsza
+            # krawędź). "Reds" startuje ~#fff5f0 (prawie biały) → ciemnoczerwony.
+            ridge_vals = np.asarray(self.pv_mesh.point_data["ridge"])
+            nz = ridge_vals[ridge_vals > 0]
+            hi = float(np.percentile(nz, 90)) if nz.size else 1.0
             self._mesh_actor = self.plotter.add_mesh(
                 self.pv_mesh,
                 scalars="ridge",
-                cmap="viridis",
+                cmap="Reds",
+                clim=(0.0, max(hi, 1e-3)),
                 show_scalar_bar=False,
                 smooth_shading=True,
                 name="mesh_actor",

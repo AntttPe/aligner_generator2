@@ -16,12 +16,27 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import connected_components
 
 
-def compute_edge_ridge_scores(mesh: trimesh.Trimesh) -> np.ndarray:
+def compute_edge_ridge_scores(
+    mesh: trimesh.Trimesh,
+    *,
+    max_angle: float = 2.5,
+    downward_thresh: float = -0.5,
+    verbose: bool = True,
+) -> np.ndarray:
     """Per-`edges_unique` ridge score (radiany kąta dwuściennego).
 
     Wysoki score = wklęsłe przegięcie o dużym kącie (kandydat na gingival
     margin / valley). Wypukłe krawędzie (cuspy, brzegi koron) dostają 0,
     żeby live-wire do nich NIE snapował. Płaskie powierzchnie ~0.
+
+    Dwa filtry odsiewające szum NIEUSUWALNY przez denoise komponentowy
+    (bo to wielkie spójne blob-y, nie kropki — głównie artefakt capping-u):
+      A) `downward_thresh`: wyklucz krawędź jeśli którakolwiek sąsiadująca
+         ściana patrzy mocno w dół (normal_z < thresh). Margin/policzkowa/
+         okluzja nigdy nie patrzą w dół — to wycina zaszumioną podstawę/czapę.
+      B) `max_angle`: odetnij zdegenerowane fałdy (kąt > ~2.5rad ≈ 145°).
+         Gingival margin ma ~30–90°; π rad (180°) to złożona geometria
+         (T-junction / fold z capping-u), nie anatomia.
     """
     n_verts = len(mesh.vertices)
     n_edges = len(mesh.edges_unique)
@@ -30,12 +45,31 @@ def compute_edge_ridge_scores(mesh: trimesh.Trimesh) -> np.ndarray:
     fa_edges = mesh.face_adjacency_edges          # (E, 2) wewnętrzne krawędzie
     fa_angles = mesh.face_adjacency_angles        # (E,) kąt dwuścienny [rad]
     fa_convex = mesh.face_adjacency_convex        # (E,) True = wypukła
+    fa_faces = mesh.face_adjacency                # (E, 2) indeksy sąsiadujących ścian
 
     if len(fa_edges) == 0:
         return ridge
 
-    # Tylko wklęsłe przegięcia liczą się jako ridge (margin to valley)
-    scores = np.where(fa_convex, 0.0, fa_angles).astype(np.float64)
+    # A) base/czapa: którakolwiek ściana patrzy w dół
+    nz = mesh.face_normals[fa_faces, 2]           # (E, 2) z-składowe normalnych
+    is_base = np.min(nz, axis=1) < downward_thresh
+    # B) zdegenerowane fałdy
+    is_fold = fa_angles > max_angle
+
+    # Tylko wklęsłe przegięcia liczą się jako ridge (margin to valley),
+    # minus base i minus fałdy.
+    exclude = fa_convex | is_base | is_fold
+    scores = np.where(exclude, 0.0, fa_angles).astype(np.float64)
+
+    if verbose:
+        n_concave = int((~fa_convex).sum())
+        n_kept = int((~exclude).sum())
+        print(
+            f"[curvature] filtr A/B: wklęsłych={n_concave}, "
+            f"base(nz<{downward_thresh})={int((is_base & ~fa_convex).sum())}, "
+            f"fold(>{max_angle:.1f}rad)={int((is_fold & ~fa_convex).sum())} "
+            f"→ ridge zostaje {n_kept}"
+        )
 
     # Wektoryzowane mapowanie face_adjacency_edges → edges_unique (po kluczu)
     eu_sorted = np.sort(mesh.edges_unique, axis=1)
