@@ -8,3 +8,6 @@ Requires-Dist: scipy>=1.11
 Requires-Dist: trimesh>=4.0
 Requires-Dist: pyvista>=0.43
 Requires-Dist: vtk>=9.3
+Requires-Dist: scikit-image>=0.22
+Requires-Dist: PySide6>=6.6
+Requires-Dist: pyvistaqt>=0.11

@@ -1,7 +1,11 @@
 pyproject.toml
 src/aligner_gen/__init__.py
 src/aligner_gen/__main__.py
+src/aligner_gen/aligner.py
+src/aligner_gen/curvature.py
 src/aligner_gen/io.py
+src/aligner_gen/qt_viewer.py
+src/aligner_gen/sdf.py
 src/aligner_gen/selection.py
 src/aligner_gen/viewer.py
 src/aligner_gen.egg-info/PKG-INFO

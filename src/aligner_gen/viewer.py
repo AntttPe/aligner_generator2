@@ -80,6 +80,10 @@ class SelectionViewer:
         self._ridge_kdtree = None      # lazy cKDTree pozycji wierzchołków ridge
         self._ridge_vert_idx = None    # indeksy wierzchołków z ridge>0
         self._snap_radius = 3.0        # [mm] max odległość snapu waypointa do margin
+        # korytarz tolerancji: ścieżka snap musi zostać w tubie wokół odcinka
+        # waypoint→waypoint. Poza tubą (szum bazy) nie wejdzie → nie zjeżdża z
+        # linii; przez lukę w margin idzie ~prosto = interpolacja. , . zmieniają.
+        self._corridor_tol = 4.0       # [mm] promień tuby wokół odcinka
 
         # aligner state
         self.aligner_mesh: trimesh.Trimesh | None = None
@@ -186,6 +190,9 @@ class SelectionViewer:
         self.plotter.add_key_event("bracketright", lambda: self._adjust_angle_threshold(+2))
         self.plotter.add_key_event("semicolon", lambda: self._adjust_min_comp(-10))
         self.plotter.add_key_event("apostrophe", lambda: self._adjust_min_comp(+10))
+        # korytarz tolerancji ścieżki (scalloped)
+        self.plotter.add_key_event("comma", lambda: self._adjust_corridor(-1.0))
+        self.plotter.add_key_event("period", lambda: self._adjust_corridor(+1.0))
 
     def _setup_buttons(self) -> None:
         """Klikalne buttony — duplikat hotkeyów dla wygody.
@@ -357,7 +364,7 @@ class SelectionViewer:
 
         self.waypoints.append(new_idx)
         if len(self.waypoints) >= 2:
-            seg = shortest_path(self._path_graph(), self.waypoints[-2], new_idx)
+            seg = self._compute_path(self.waypoints[-2], new_idx)
             if seg.size == 0:
                 print("[viewer] Brak ścieżki między waypointami.")
                 self.waypoints.pop()
@@ -378,7 +385,7 @@ class SelectionViewer:
         if len(self.waypoints) < 3:
             print("[viewer] Potrzeba ≥3 waypointów żeby zamknąć pętlę.")
             return
-        seg = shortest_path(self._path_graph(), self.waypoints[-1], self.waypoints[0])
+        seg = self._compute_path(self.waypoints[-1], self.waypoints[0])
         if seg.size == 0:
             print("[viewer] Nie udało się znaleźć ścieżki zamykającej pętlę.")
             return
@@ -448,6 +455,69 @@ class SelectionViewer:
         if self.trim_mode == "scalloped":
             return self._ensure_snap_graph()
         return self.graph
+
+    def _compute_path(self, a: int, b: int) -> np.ndarray:
+        """Ścieżka konturu a→b. Scalloped: snap z korytarzem tolerancji (fallback
+        pełny snap gdy luka większa niż korytarz). Manual: geodesic."""
+        if self.trim_mode == "scalloped":
+            p = self._scalloped_path(a, b)
+            if p is not None and p.size:
+                return p
+            print(
+                "[viewer] korytarz: brak ścieżki w tolerancji — fallback pełny "
+                "snap (rozszerz korytarz '.' albo kliknij gęściej)."
+            )
+            return shortest_path(self._ensure_snap_graph(), a, b)
+        return shortest_path(self.graph, a, b)
+
+    def _scalloped_path(self, a: int, b: int) -> np.ndarray | None:
+        """Dijkstra na snap-grafie ograniczonym do tuby `_corridor_tol` wokół
+        odcinka a-b. W tubie ścieżka spływa do margin; szum bazy jest poza tubą
+        więc nie zjeżdża. Luka w margin → najkrótsza w tubie idzie ~prosto.
+        Zwraca indeksy wierzchołków albo None gdy w tubie brak połączenia."""
+        from scipy.sparse.csgraph import dijkstra
+
+        G = self._ensure_snap_graph()
+        V = self.mesh.vertices
+        va, vb = V[a], V[b]
+        seg = vb - va
+        L2 = float(seg @ seg)
+        if L2 < 1e-12:
+            dist_seg = np.linalg.norm(V - va, axis=1)
+        else:
+            t = np.clip(((V - va) @ seg) / L2, 0.0, 1.0)
+            proj = va + t[:, None] * seg
+            dist_seg = np.linalg.norm(V - proj, axis=1)
+
+        mask = dist_seg <= self._corridor_tol
+        mask[a] = True
+        mask[b] = True
+
+        idx_map = np.where(mask)[0]
+        sub = G[mask][:, mask]
+        ra = int(np.searchsorted(idx_map, a))
+        rb = int(np.searchsorted(idx_map, b))
+
+        d, pred = dijkstra(sub, indices=ra, return_predecessors=True)
+        if not np.isfinite(d[rb]):
+            return None
+
+        path = [rb]
+        j = rb
+        while j != ra:
+            j = int(pred[j])
+            if j < 0:
+                return None
+            path.append(j)
+        path.reverse()
+        return idx_map[np.asarray(path, dtype=np.int64)]
+
+    def _adjust_corridor(self, delta: float) -> None:
+        self._corridor_tol = float(np.clip(self._corridor_tol + delta, 1.0, 15.0))
+        print(
+            f"[viewer] korytarz tolerancji = {self._corridor_tol:.1f}mm "
+            f"(niżej = ściślej trzyma linię, wyżej = luźniej przez luki)"
+        )
 
     def _ensure_ridge_kdtree(self):
         """Lazy cKDTree wierzchołków margin (ridge>0) do snapu waypointów."""
@@ -878,6 +948,7 @@ class SelectionViewer:
             f"Klik = waypoint  |  klik blisko 1.zielonego = zamknij\n"
             f"[C] close  [F] fill (auto)  [G] seed-fill  [I] invert\n"
             f"[W] trim manual/scalloped  [V] heatmapa  [ ] prog ridge  ; ' rozmiar\n"
+            f", . korytarz tolerancji ({self._corridor_tol:.0f}mm)\n"
             f"[Z] undo  [X] clear  [S] save  [L] load\n"
             f"[N] generate  [E] export STL  [P] preview/final  [H] aligner  [M] teeth"
         )
