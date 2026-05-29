@@ -219,6 +219,26 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self.params = AlignerParams()
         self._quality_mode = "final"
         self.params.voxel_pitch = 0.10
+        # ----- state: rim + apex + pillars (S1/S2/S3 support generation) -----
+        from .supports import PillarParams
+        self.rim_mask: np.ndarray | None = None
+        self._rim_actor = None
+        self._apex_loop: np.ndarray | None = None   # cache apex polyline
+        self.anchors: np.ndarray | None = None      # spróbkowane kotwice (N, 3)
+        self._anchors_actor = None
+        self._anchor_spacing = 3.0                  # mm między kotwicami
+        # S3: geometria pillarów
+        self.pillar_params = PillarParams()
+        self._pillar_direction: np.ndarray | None = None
+        self.pillars_mesh = None                    # trimesh.Trimesh | None
+        self._pillars_actor = None
+        # S5: orientacja druku (nachylenie 45°, front/back, pillary do raftu)
+        self._tilt_angle = 45.0                     # ° (-45..+45; znak = która strona nisko)
+        self._print_view = False                    # czy widok print-ready (tilted)
+        self._ap_frame = None                       # cache detekcji przód/tył
+        self._print_transform = np.eye(4)
+        self._display_matrix = np.eye(4)            # user_matrix aktorów scan-space
+        self._ground_actor = None                   # płaszczyzna Z=0 (platforma)
 
         # ----- geometria -----
         bbox = self.mesh.bounds
@@ -340,6 +360,31 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             "Pokaż/ukryj zęby", checkable=True,
         )
         self._act_show_mesh.setChecked(True)
+        self._act_show_rim = add_action(
+            "Rim (krawędź)", self._toggle_rim_visibility, "B",
+            "Podświetl wykrytą krawędź trim nakładki (dla podpór druku)",
+            checkable=True,
+        )
+        self._act_show_rim.setChecked(True)
+        self._act_show_anchors = add_action(
+            "Kotwice", self._toggle_anchors_visibility, "K",
+            "Pokaż próbki na apex line — przyszłe punkty kotwiczenia podpór",
+            checkable=True,
+        )
+        self._act_show_anchors.setChecked(True)
+        self._act_show_pillars = add_action(
+            "Podpory", self._toggle_pillars_visibility, "P",
+            "Pokaż pillary druku (stożek tip + cylinder body, per kotwica)",
+            checkable=True,
+        )
+        self._act_show_pillars.setChecked(True)
+        tb.addSeparator()
+        self._act_print_view = add_action(
+            "Widok druku", self._toggle_print_view, "D",
+            "Nachyl nakładkę do orientacji druku (pillary pionowo do raftu Z=0)",
+            checkable=True,
+        )
+        self._act_print_view.setChecked(False)
 
     def _build_param_dock(self):
         dock = QtWidgets.QDockWidget("Parametry", self)
@@ -439,6 +484,57 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self.btn_generate.clicked.connect(self._generate_aligner)
         outer_lay.addWidget(self.btn_generate)
 
+        # ----- Grupa: Podpory druku — kotwice (S2) -----
+        g5 = QtWidgets.QGroupBox("Kotwice podpór (S2)")
+        f5 = QtWidgets.QVBoxLayout(g5)
+        self.sl_anchor_spacing = LabeledSlider(
+            "Rozstaw kotwic", 1.0, 6.0, self._anchor_spacing, 0.5,
+            decimals=1, suffix=" mm",
+        )
+        self.sl_anchor_spacing.valueChanged.connect(self._on_anchor_spacing_change)
+        f5.addWidget(self.sl_anchor_spacing)
+        outer_lay.addWidget(g5)
+
+        # ----- Grupa: Geometria pillarów (S3) -----
+        g6 = QtWidgets.QGroupBox("Geometria pillarów (S3)")
+        f6 = QtWidgets.QVBoxLayout(g6)
+        self.sl_tip_dia = LabeledSlider(
+            "Tip Ø (kontakt)", 0.2, 0.8, self.pillar_params.tip_diameter, 0.05,
+            decimals=2, suffix=" mm",
+        )
+        self.sl_body_dia = LabeledSlider(
+            "Body Ø (trzon)", 0.5, 1.5, self.pillar_params.body_diameter, 0.05,
+            decimals=2, suffix=" mm",
+        )
+        self.sl_pillar_h = LabeledSlider(
+            "Wysokość pillara", 3.0, 15.0, self.pillar_params.pillar_height, 0.5,
+            decimals=1, suffix=" mm",
+        )
+        for w in (self.sl_tip_dia, self.sl_body_dia, self.sl_pillar_h):
+            f6.addWidget(w)
+        self.sl_tip_dia.valueChanged.connect(self._on_tip_dia_change)
+        self.sl_body_dia.valueChanged.connect(self._on_body_dia_change)
+        self.sl_pillar_h.valueChanged.connect(self._on_pillar_h_change)
+        outer_lay.addWidget(g6)
+
+        # ----- Grupa: Orientacja druku (S5) -----
+        g7 = QtWidgets.QGroupBox("Orientacja druku (S5)")
+        f7 = QtWidgets.QVBoxLayout(g7)
+        self.sl_tilt = LabeledSlider(
+            "Nachylenie", -45.0, 45.0, self._tilt_angle, 1.0,
+            decimals=0, suffix=" °",
+        )
+        self.sl_tilt.valueChanged.connect(self._on_tilt_change)
+        f7.addWidget(self.sl_tilt)
+        hint = QtWidgets.QLabel(
+            "+ = przód (siekacze) do góry · − = przód nisko.\n"
+            "Włącz „Widok druku\" [D] żeby zobaczyć."
+        )
+        hint.setStyleSheet("color: #999; font-size: 10px;")
+        hint.setWordWrap(True)
+        f7.addWidget(hint)
+        outer_lay.addWidget(g7)
+
         outer_lay.addStretch(1)
 
         # scroll wrapper — gdy okno wąskie
@@ -475,6 +571,15 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
     def _combined_mask(self) -> np.ndarray:
         return self.boundary_mask | self.fill_mask
 
+    def _set_matrix(self, actor):
+        """Ustaw user_matrix aktora = display matrix (nachylenie print view)."""
+        if actor is None:
+            return
+        try:
+            actor.user_matrix = self._display_matrix
+        except Exception:
+            pass
+
     def _add_main_mesh(self, scalars: str):
         if self._mesh_actor is not None:
             self.plotter.remove_actor(self._mesh_actor, render=False)
@@ -506,6 +611,7 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
                 name="mesh_actor",
                 reset_camera=False,
             )
+        self._set_matrix(self._mesh_actor)
 
     def _update_status(self):
         n_sel = int(self._combined_mask().sum())
@@ -909,20 +1015,27 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         wykonanie do następnego ticka — UI zdąży się zaktualizować, bez
         re-entrancy.
         """
-        if not self._combined_mask().any():
-            print("[qt_viewer] Brak selekcji — najpierw zaznacz powierzchnię.")
-            return
-        if self._combined_mask().sum() < 5000:
-            print("[qt_viewer] UWAGA: selekcja < 5000 verts — nakładka będzie mała.")
-        eta = "12" if self._quality_mode == "preview" else "90"
-        self.btn_generate.setEnabled(False)
-        self.status.showMessage(
-            f"Generuję nakładkę ({self._quality_mode.upper()})... "
-            f"— okno zamarza na ~{eta}s (Faza 3 doda QThread + progress)"
-        )
-        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
-        # defer ciężkiej pracy do następnego event-loop tick → UI flush, brak re-entrancy
-        QtCore.QTimer.singleShot(0, self._do_generate)
+        print("[qt_viewer] _generate_aligner: start", flush=True)
+        try:
+            if not self._combined_mask().any():
+                print("[qt_viewer] Brak selekcji — najpierw zaznacz powierzchnię.")
+                return
+            if self._combined_mask().sum() < 5000:
+                print("[qt_viewer] UWAGA: selekcja < 5000 verts — nakładka będzie mała.")
+            eta = "12" if self._quality_mode == "preview" else "90"
+            self.btn_generate.setEnabled(False)
+            self.status.showMessage(
+                f"Generuję nakładkę ({self._quality_mode.upper()})... "
+                f"— okno zamarza na ~{eta}s (Faza 3 doda QThread + progress)"
+            )
+            print("[qt_viewer] _generate_aligner: scheduling _do_generate", flush=True)
+            # defer ciężkiej pracy do następnego event-loop tick → UI flush, brak re-entrancy
+            QtCore.QTimer.singleShot(0, self._do_generate)
+        except Exception as e:
+            import traceback
+            print(f"[qt_viewer] _generate_aligner ERROR: {e}", flush=True)
+            traceback.print_exc()
+            sys.stdout.flush()
 
     def _do_generate(self):
         """Faktyczna ciężka generacja — odpalana po ticku event loopu."""
@@ -936,14 +1049,39 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             )
             mesh, report = generate_aligner(self.mesh, self._combined_mask(), self.params)
             self.aligner_mesh = mesh
+            self.rim_mask = report.rim_mask  # S1: krawędź dla podpór
+            # S2: apex polyline cache invalidate (nowa nakładka = nowy apex)
+            self._apex_loop = None
             print(
                 f"[qt_viewer] OK: {len(mesh.vertices)} verts, "
-                f"watertight={mesh.is_watertight}, t={report.total_seconds:.1f}s",
+                f"watertight={mesh.is_watertight}, t={report.total_seconds:.1f}s"
+                + (
+                    f", rim={int(self.rim_mask.sum())}v"
+                    if self.rim_mask is not None
+                    else ""
+                ),
                 flush=True,
             )
             for n in report.notes:
                 print(f"  ! {n}", flush=True)
+            # S5: nowa nakładka → invaliduj cache detekcji przód/tył
+            self._ap_frame = None
             self._refresh_aligner()
+            self._refresh_rim()
+            # S2: wyciągnij apex + sampluj kotwice
+            self._recompute_anchors()
+            self._refresh_anchors()
+            # S5: auto-włącz widok druku (pokaż print-ready: tilt + podpory)
+            if not self._print_view:
+                self._print_view = True
+                self._act_print_view.setChecked(True)
+            self._display_matrix = self._ensure_print_transform()
+            self._apply_display_matrix()
+            self._refresh_ground()
+            # S3/S5: pillary w print space (pionowo do raftu)
+            self._recompute_pillars()
+            self._refresh_pillars()
+            self.plotter.reset_camera()
         except Exception as e:
             print(f"[qt_viewer] Generate ERROR: {e}", flush=True)
             import traceback
@@ -951,7 +1089,6 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             sys.stdout.flush()
             QtWidgets.QMessageBox.critical(self, "Błąd generacji", str(e))
         finally:
-            QtWidgets.QApplication.restoreOverrideCursor()
             self.btn_generate.setEnabled(True)
             self._update_status()
 
@@ -976,10 +1113,242 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             name="aligner_actor",
             reset_camera=False,
         )
+        self._set_matrix(self._aligner_actor)
         self.plotter.render()
 
     def _toggle_aligner_visibility(self):
         self._refresh_aligner()
+
+    def _refresh_rim(self):
+        """S1: render zielone kulki na vertices rim (krawędź trim nakładki)."""
+        if self._rim_actor is not None:
+            self.plotter.remove_actor(self._rim_actor, render=False)
+            self._rim_actor = None
+        if (
+            self.aligner_mesh is None
+            or self.rim_mask is None
+            or not self._act_show_rim.isChecked()
+        ):
+            self.plotter.render()
+            return
+        rim_pts = np.asarray(self.aligner_mesh.vertices)[self.rim_mask]
+        if rim_pts.size == 0:
+            self.plotter.render()
+            return
+        self._rim_actor = self.plotter.add_mesh(
+            pv.PolyData(rim_pts),
+            color="#22c55e",  # zielony — kontrast do cyjanowej nakładki
+            point_size=6,
+            render_points_as_spheres=True,
+            name="rim_actor",
+            reset_camera=False,
+        )
+        self._set_matrix(self._rim_actor)
+        self.plotter.render()
+
+    def _toggle_rim_visibility(self):
+        self._refresh_rim()
+
+    # ---------- S2: apex / kotwice ----------
+    def _recompute_anchors(self):
+        """Wyciągnij apex polyline i sampluj kotwice. Wywoływane raz po
+        generacji + przy każdej zmianie slidera rozstawu (resampling jest tani)."""
+        from .supports import extract_apex_loop, sample_apex_loop
+
+        if self.aligner_mesh is None or self.rim_mask is None:
+            self._apex_loop = None
+            self.anchors = None
+            return
+        if self._apex_loop is None:
+            self._apex_loop = extract_apex_loop(self.aligner_mesh, self.rim_mask)
+            print(f"[qt_viewer] apex polyline: {len(self._apex_loop)} pts")
+        self.anchors = sample_apex_loop(self._apex_loop, self._anchor_spacing)
+        print(
+            f"[qt_viewer] kotwice ({self._anchor_spacing:.1f}mm): "
+            f"{len(self.anchors)} pkt"
+        )
+
+    def _refresh_anchors(self):
+        """Render kotwic jako żółte kulki (większe niż rim dots)."""
+        if self._anchors_actor is not None:
+            self.plotter.remove_actor(self._anchors_actor, render=False)
+            self._anchors_actor = None
+        if (
+            self.anchors is None
+            or len(self.anchors) == 0
+            or not self._act_show_anchors.isChecked()
+        ):
+            self.plotter.render()
+            return
+        self._anchors_actor = self.plotter.add_mesh(
+            pv.PolyData(self.anchors),
+            color="#fbbf24",  # żółty — kontrast do zielonego rim
+            point_size=14,
+            render_points_as_spheres=True,
+            name="anchors_actor",
+            reset_camera=False,
+        )
+        self._set_matrix(self._anchors_actor)
+        self.plotter.render()
+
+    def _toggle_anchors_visibility(self):
+        self._refresh_anchors()
+
+    def _on_anchor_spacing_change(self, v):
+        """Slider live — resampling jest tani (~ms), nie wymaga regeneracji."""
+        self._anchor_spacing = float(v)
+        if self._apex_loop is not None:
+            from .supports import sample_apex_loop
+            self.anchors = sample_apex_loop(self._apex_loop, self._anchor_spacing)
+            self._refresh_anchors()
+            # zmiana liczby kotwic → rebuild pillars
+            self._recompute_pillars()
+            self._refresh_pillars()
+
+    # ---------- S3: pillar geometry ----------
+    def _recompute_pillars(self):
+        """Pillary w print space: kotwice → orientacja druku → pionowo -Z do
+        raftu Z=0. Budowane TYLKO w widoku druku (poza nim "dół" niezdefiniowany).
+        """
+        from .supports import generate_pillars_to_plane, transform_points
+
+        if self.anchors is None or not self._print_view:
+            self.pillars_mesh = None
+            return
+        anchors_print = transform_points(self.anchors, self._display_matrix)
+        self.pillars_mesh = generate_pillars_to_plane(
+            anchors_print, 0.0, self.pillar_params
+        )
+        if self.pillars_mesh is not None:
+            print(
+                f"[qt_viewer] pillars→raft: {len(self.anchors)} kotwic → "
+                f"{len(self.pillars_mesh.vertices)}v / {len(self.pillars_mesh.faces)}f"
+            )
+
+    def _refresh_pillars(self):
+        """Render pillars jako bryła pomarańczowa (~kontrast do cyjana aligner)."""
+        if self._pillars_actor is not None:
+            self.plotter.remove_actor(self._pillars_actor, render=False)
+            self._pillars_actor = None
+        if (
+            self.pillars_mesh is None
+            or not self._act_show_pillars.isChecked()
+        ):
+            self.plotter.render()
+            return
+        # konwersja trimesh → pv.PolyData
+        faces_flat = np.hstack(
+            [np.full((len(self.pillars_mesh.faces), 1), 3, dtype=np.int64),
+             self.pillars_mesh.faces]
+        ).ravel()
+        poly = pv.PolyData(np.asarray(self.pillars_mesh.vertices), faces_flat)
+        self._pillars_actor = self.plotter.add_mesh(
+            poly,
+            color="#f97316",   # pomarańczowy — kontrast do cyjana
+            smooth_shading=True,
+            specular=0.4,
+            specular_power=20,
+            name="pillars_actor",
+            reset_camera=False,
+        )
+        self.plotter.render()
+
+    def _toggle_pillars_visibility(self):
+        self._refresh_pillars()
+
+    def _on_tip_dia_change(self, v):
+        self.pillar_params.tip_diameter = float(v)
+        self._recompute_pillars()
+        self._refresh_pillars()
+
+    def _on_body_dia_change(self, v):
+        self.pillar_params.body_diameter = float(v)
+        self._recompute_pillars()
+        self._refresh_pillars()
+
+    def _on_pillar_h_change(self, v):
+        self.pillar_params.pillar_height = float(v)
+        self._recompute_pillars()
+        self._refresh_pillars()
+
+    # ---------- S5: orientacja druku (nachylenie + front/back) ----------
+    def _ensure_print_transform(self):
+        from .supports import compute_print_transform, detect_anterior_posterior
+
+        if self.aligner_mesh is None:
+            return np.eye(4)
+        if self._ap_frame is None:
+            self._ap_frame = detect_anterior_posterior(
+                self.aligner_mesh, rim_mask=self.rim_mask
+            )
+        self._print_transform = compute_print_transform(
+            self.aligner_mesh, self._ap_frame, self._tilt_angle, z_gap=2.0
+        )
+        return self._print_transform
+
+    def _apply_display_matrix(self):
+        """Ustaw user_matrix na wszystkich aktorach scan-space (nachyl je)."""
+        for actor in (
+            self._mesh_actor, self._aligner_actor, self._rim_actor,
+            self._anchors_actor, self._waypoint_actor,
+            self._first_waypoint_actor, self._contour_actor,
+        ):
+            self._set_matrix(actor)
+
+    def _refresh_ground(self):
+        """Płaszczyzna Z=0 (platforma druku) — tylko w widoku druku."""
+        from .supports import transform_points
+
+        if self._ground_actor is not None:
+            self.plotter.remove_actor(self._ground_actor, render=False)
+            self._ground_actor = None
+        if not self._print_view or self.aligner_mesh is None:
+            return
+        at = transform_points(
+            np.asarray(self.aligner_mesh.vertices), self._display_matrix
+        )
+        cx, cy = float(at[:, 0].mean()), float(at[:, 1].mean())
+        sx = float(at[:, 0].max() - at[:, 0].min()) * 1.4 + 5.0
+        sy = float(at[:, 1].max() - at[:, 1].min()) * 1.4 + 5.0
+        plane = pv.Plane(
+            center=(cx, cy, 0.0), direction=(0, 0, 1), i_size=sx, j_size=sy
+        )
+        self._ground_actor = self.plotter.add_mesh(
+            plane, color="#2a2a2a", opacity=0.55, name="ground_actor",
+            reset_camera=False,
+        )
+
+    def _toggle_print_view(self):
+        self._print_view = self._act_print_view.isChecked()
+        if self._print_view:
+            if self.aligner_mesh is None:
+                print("[qt_viewer] Widok druku: najpierw wygeneruj nakładkę.")
+                self._act_print_view.setChecked(False)
+                self._print_view = False
+                return
+            self._display_matrix = self._ensure_print_transform()
+        else:
+            self._display_matrix = np.eye(4)
+        self._apply_display_matrix()
+        self._recompute_pillars()
+        self._refresh_pillars()
+        self._refresh_ground()
+        self.plotter.reset_camera()
+        self.plotter.render()
+        print(
+            f"[qt_viewer] Widok druku: {'ON (tilt %.0f°)' % self._tilt_angle if self._print_view else 'OFF'}"
+        )
+
+    def _on_tilt_change(self, v):
+        self._tilt_angle = float(v)
+        if not self._print_view or self.aligner_mesh is None:
+            return
+        self._display_matrix = self._ensure_print_transform()
+        self._apply_display_matrix()
+        self._recompute_pillars()
+        self._refresh_pillars()
+        self._refresh_ground()
+        self.plotter.render()
 
     def _toggle_mesh_visibility(self):
         if self._mesh_actor is None:
@@ -1053,7 +1422,26 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
 _CURRENT_WIN: AlignerMainWindow | None = None
 
 
+def _install_crash_diagnostics():
+    """faulthandler → natywny stack na SIGTRAP/SIGSEGV. excepthook → wyjątki
+    Python (PySide6 6.11 abortuje na nieobsłużonym wyjątku w slocie, często
+    bez widocznego tracebacku — to go wyłapuje i drukuje przed abortem)."""
+    import faulthandler
+    faulthandler.enable()
+
+    def _hook(exc_type, exc_value, exc_tb):
+        import traceback
+        print("=" * 60, flush=True)
+        print("[qt_viewer] NIEOBSŁUŻONY WYJĄTEK:", flush=True)
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+        sys.stdout.flush()
+        sys.stderr.flush()
+
+    sys.excepthook = _hook
+
+
 def run(stl_path: str | Path) -> int:
+    _install_crash_diagnostics()
     p = Path(stl_path)
     if not p.exists():
         print(f"[qt_viewer] Plik nie istnieje: {p}", file=sys.stderr)

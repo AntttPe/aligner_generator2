@@ -81,6 +81,10 @@ class GenerationReport:
     holes_filled: int = 0
     total_seconds: float = 0.0
     notes: list[str] = field(default_factory=list)
+    # S1 (support generation): per-vertex maska na mesh nakładki — True dla
+    # vertices na krawędzi trim (cięcie sel/owner), False dla face. Używane
+    # przez `supports.py` do umieszczania kotwic podpór dokładnie na krawędzi.
+    rim_mask: np.ndarray | None = None
 
 
 def generate_aligner(
@@ -310,6 +314,30 @@ def generate_aligner(
 
     rep.aligner_verts = len(mesh_out.vertices)
     rep.aligner_faces = len(mesh_out.faces)
+
+    # ---- S1: rim detection (krawędź trim dla podpór druku) ----
+    # Trilinear-sample pól komponentowych na finalnych vertices nakładki.
+    # Vertex jest "rim" gdy sel/owner wiąże (nie wall) → cięcie wzdłuż gingival.
+    try:
+        from .supports import compute_rim_mask
+        t = time.time()
+        rep.rim_mask = compute_rim_mask(
+            np.asarray(mesh_out.vertices, dtype=float),
+            sdf,
+            wall,
+            sel_field,
+            owner_signed,
+        )
+        n_rim = int(rep.rim_mask.sum())
+        print(
+            f"[aligner]   rim detection: {n_rim}/{rep.aligner_verts} verts "
+            f"({100.0 * n_rim / max(rep.aligner_verts, 1):.1f}%) "
+            f"({time.time() - t:.2f}s)"
+        )
+    except Exception as e:
+        print(f"[aligner]   rim detection warning: {e}")
+        rep.rim_mask = None
+
     rep.total_seconds = time.time() - t_total
     print(
         f"[aligner] GOTOWE w {rep.total_seconds:.1f}s — "
