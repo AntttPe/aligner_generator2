@@ -239,6 +239,30 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self._print_transform = np.eye(4)
         self._display_matrix = np.eye(4)            # user_matrix aktorów scan-space
         self._ground_actor = None                   # płaszczyzna Z=0 (platforma)
+        # S4: raft (płyta pod pillarami)
+        self.raft_mesh = None                       # trimesh.Trimesh | None
+        self._raft_actor = None
+        self._raft_thickness = 1.5                  # mm
+        self._raft_band_width = 4.0                 # mm — szerokość wstęgi U
+        # Drainage hole — likwiduje "Cup Detected" w PreForm dla wnętrza cap-u
+        # 0 = wyłączony, >0 = promień otworu w mm na top occlusal w print Z
+        self._drainage_hole_radius = 1.5            # mm (default 3mm Ø = klinicznie OK)
+        # Solid disk raft (vs U-band) — likwiduje "Cup Detected" dla U-band cavity
+        self._raft_solid_disk = False
+        # S4.5: łączniki (zigzag cross-bracing anti-collapse)
+        self.braces_mesh = None                     # trimesh.Trimesh | None
+        self._braces_actor = None
+        self._brace_angle = 45.0                    # ° od poziomu
+        self._brace_diameter = 0.6                  # mm
+        # S5.5: overhang detection + priorytetowe podpory
+        self._overhang_angle = 45.0                 # ° od poziomu (próg krytyczny)
+        self.overhang_anchors = None
+        self.overhang_faces_mesh = None             # rim overhang (czerwony — dostaje pillary)
+        self.overhang_nonrim_faces_mesh = None      # occlusal overhang (pomarańczowy — info)
+        self.overhang_pillars_mesh = None
+        self._overhang_faces_actor = None
+        self._overhang_nonrim_faces_actor = None
+        self._overhang_pillars_actor = None
 
         # ----- geometria -----
         bbox = self.mesh.bounds
@@ -347,7 +371,15 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         tb.addSeparator()
 
         add_action("Generuj", self._generate_aligner, "N", "Generuj nakładkę z selekcji")
-        add_action("Eksport STL", self._export_aligner, "E", "Zapisz nakładkę jako STL")
+        add_action(
+            "Eksport nakładki", self._export_aligner, "E",
+            "Zapisz samą nakładkę jako STL (scan space — do testu fit-u)",
+        )
+        add_action(
+            "Eksport do druku", self._export_print_assembly, "Shift+E",
+            "Zapisz pełny zestaw print-ready: nakładka + pillary + braces + raft "
+            "w print space (multi-solid STL gotowy do slicera)",
+        )
         tb.addSeparator()
 
         self._act_show_aligner = add_action(
@@ -385,6 +417,24 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             checkable=True,
         )
         self._act_print_view.setChecked(False)
+        self._act_show_raft = add_action(
+            "Raft", self._toggle_raft_visibility, "A",
+            "Pokaż raft (płyta pod pillarami na Z=0)",
+            checkable=True,
+        )
+        self._act_show_raft.setChecked(True)
+        self._act_show_braces = add_action(
+            "Łączniki", self._toggle_braces_visibility, "J",
+            "Pokaż zigzag łączniki między pillarami (anti-collapse truss)",
+            checkable=True,
+        )
+        self._act_show_braces.setChecked(True)
+        self._act_show_overhang = add_action(
+            "Overhangi", self._toggle_overhang_visibility, "O",
+            "Podświetl ściany overhang (czerwone) + priorytetowe podpory pod nimi",
+            checkable=True,
+        )
+        self._act_show_overhang.setChecked(True)
 
     def _build_param_dock(self):
         dock = QtWidgets.QDockWidget("Parametry", self)
@@ -521,11 +571,59 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         g7 = QtWidgets.QGroupBox("Orientacja druku (S5)")
         f7 = QtWidgets.QVBoxLayout(g7)
         self.sl_tilt = LabeledSlider(
-            "Nachylenie", -45.0, 45.0, self._tilt_angle, 1.0,
+            "Nachylenie", -50.0, 50.0, self._tilt_angle, 1.0,
             decimals=0, suffix=" °",
         )
         self.sl_tilt.valueChanged.connect(self._on_tilt_change)
+        self.sl_tilt.valueChangedFinal.connect(self._on_tilt_release)
         f7.addWidget(self.sl_tilt)
+        # Button: optymalizacja kąta — szybki sweep -50..+50° po metryce
+        # non-rim overhang (powierzchnia okluzyjna/fit), ustawia slider na
+        # minimum. ~1s na 350k faces — może działać live.
+        self.btn_opt_tilt = QtWidgets.QPushButton("Optymalizuj nachylenie")
+        self.btn_opt_tilt.setToolTip(
+            "Sweep kątów ±50° — znajdź ten z najmniejszym overhangem na "
+            "powierzchni okluzyjnej (poza rim). Ustawia slider automatycznie."
+        )
+        self.btn_opt_tilt.clicked.connect(self._optimize_tilt)
+        f7.addWidget(self.btn_opt_tilt)
+        self.sl_raft_thick = LabeledSlider(
+            "Grubość raftu", 0.5, 4.0, self._raft_thickness, 0.5,
+            decimals=1, suffix=" mm",
+        )
+        self.sl_raft_thick.valueChanged.connect(self._on_raft_thick_change)
+        f7.addWidget(self.sl_raft_thick)
+        # Drainage hole (anty "Cup Detected" w PreForm) — promień otworu
+        # na szczycie cap-u w print Z. 0 = wyłączony. Dodaje się tylko
+        # podczas eksportu (boolean — wolny, ~0.5-2s).
+        self.sl_drainage = LabeledSlider(
+            "Drainage hole (promień)", 0.0, 2.5, self._drainage_hole_radius, 0.25,
+            decimals=2, suffix=" mm",
+        )
+        self.sl_drainage.setToolTip(
+            "Otwór drenażowy na szczycie cap-u w print Z — likwiduje "
+            "PreForm \"Cup Detected\" (trapped resin). 0 = wyłączony. "
+            "Klinicznie standardowe ~1.5mm radius (3mm Ø). Stosowany podczas "
+            "eksportu do druku."
+        )
+        self.sl_drainage.valueChanged.connect(self._on_drainage_change)
+        f7.addWidget(self.sl_drainage)
+        # Solid disk raft (anti-cup) toggle
+        self.cb_raft_solid = QtWidgets.QCheckBox("Raft jako pełny disk (anti-cup)")
+        self.cb_raft_solid.setChecked(self._raft_solid_disk)
+        self.cb_raft_solid.setToolTip(
+            "Zamiast U-wstęgi raft pełni convex hull XY kotwic. Likwiduje "
+            "PreForm \"Cup Detected\" (U-band ring = closed cavity outline). "
+            "Trade-off: ~30% więcej resin, mocniejsza adhesion do build plate."
+        )
+        self.cb_raft_solid.stateChanged.connect(self._on_raft_solid_change)
+        f7.addWidget(self.cb_raft_solid)
+        self.sl_raft_width = LabeledSlider(
+            "Szerokość wstęgi raftu", 2.0, 8.0, self._raft_band_width, 0.5,
+            decimals=1, suffix=" mm",
+        )
+        self.sl_raft_width.valueChanged.connect(self._on_raft_width_change)
+        f7.addWidget(self.sl_raft_width)
         hint = QtWidgets.QLabel(
             "+ = przód (siekacze) do góry · − = przód nisko.\n"
             "Włącz „Widok druku\" [D] żeby zobaczyć."
@@ -534,6 +632,48 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         hint.setWordWrap(True)
         f7.addWidget(hint)
         outer_lay.addWidget(g7)
+
+        # ----- Grupa: Łączniki anti-collapse (S4.5) -----
+        g8 = QtWidgets.QGroupBox("Łączniki pillarów (S4.5)")
+        f8 = QtWidgets.QVBoxLayout(g8)
+        self.sl_brace_angle = LabeledSlider(
+            "Kąt łączników", 30.0, 70.0, self._brace_angle, 1.0,
+            decimals=0, suffix=" °",
+        )
+        self.sl_brace_dia = LabeledSlider(
+            "Grubość łącznika", 0.4, 1.0, self._brace_diameter, 0.05,
+            decimals=2, suffix=" mm",
+        )
+        self.sl_brace_angle.valueChanged.connect(self._on_brace_angle_change)
+        self.sl_brace_dia.valueChanged.connect(self._on_brace_dia_change)
+        f8.addWidget(self.sl_brace_angle)
+        f8.addWidget(self.sl_brace_dia)
+        bhint = QtWidgets.QLabel(
+            "Wyższy kąt = rzadsze/strome (mniej materiału).\n45° = sweet spot."
+        )
+        bhint.setStyleSheet("color: #999; font-size: 10px;")
+        bhint.setWordWrap(True)
+        f8.addWidget(bhint)
+        outer_lay.addWidget(g8)
+
+        # ----- Grupa: Overhangi (S5.5) -----
+        g9 = QtWidgets.QGroupBox("Overhangi — anti-air-print (S5.5)")
+        f9 = QtWidgets.QVBoxLayout(g9)
+        self.sl_overhang_angle = LabeledSlider(
+            "Kąt krytyczny", 30.0, 60.0, self._overhang_angle, 1.0,
+            decimals=0, suffix=" °",
+        )
+        # wolny (layer-sweep) → release only
+        self.sl_overhang_angle.valueChangedFinal.connect(self._on_overhang_angle_change)
+        f9.addWidget(self.sl_overhang_angle)
+        ohint = QtWidgets.QLabel(
+            "Czerwone = ściany drukowane w powietrzu — dostaną podpory.\n"
+            "Kręć sliderem Nachylenie żeby zminimalizować czerwień."
+        )
+        ohint.setStyleSheet("color: #999; font-size: 10px;")
+        ohint.setWordWrap(True)
+        f9.addWidget(ohint)
+        outer_lay.addWidget(g9)
 
         outer_lay.addStretch(1)
 
@@ -1081,6 +1221,15 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             # S3/S5: pillary w print space (pionowo do raftu)
             self._recompute_pillars()
             self._refresh_pillars()
+            # S4.5: zigzag łączniki
+            self._recompute_braces()
+            self._refresh_braces()
+            # S4: raft pod pillarami (MUSI być przed overhang — overhang potrzebuje raftu)
+            self._recompute_raft()
+            self._refresh_raft()
+            # S5.5: overhang layer-sweep (po rafcie + pillarach — żeby layer-sweep miał na czym propagować)
+            self._recompute_overhang()
+            self._refresh_overhang()
             self.plotter.reset_camera()
         except Exception as e:
             print(f"[qt_viewer] Generate ERROR: {e}", flush=True)
@@ -1209,19 +1358,44 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
     def _recompute_pillars(self):
         """Pillary w print space: kotwice → orientacja druku → pionowo -Z do
         raftu Z=0. Budowane TYLKO w widoku druku (poza nim "dół" niezdefiniowany).
+
+        **Dodatkowo wykrywamy rim local minima** (dipsy w print Z na apex_loop
+        między evenly-spaced kotwicami) i dorzucamy pillary tam — eliminuje
+        PreForm "Unsupported Minima Detected" flagi.
         """
-        from .supports import generate_pillars_to_plane, transform_points
+        from .supports import (
+            detect_rim_local_minima, generate_pillars_to_plane, transform_points,
+        )
 
         if self.anchors is None or not self._print_view:
             self.pillars_mesh = None
             return
         anchors_print = transform_points(self.anchors, self._display_matrix)
+
+        # Rim local minima — XY-neighborhood (NIE arc length) → matchuje
+        # PreForm semantikę "unsupported minimum". xy_radius=2mm — szukamy
+        # punktów które są najniższe w okolice w print Z. dedupe=0.5mm:
+        # pillar cone z tip_diameter+tip_height pokrywa ~0.3-0.5mm XY, więc
+        # minimum dalej niż 0.5mm od istniejącego pillara = niezakryty.
+        extra_anchors = np.zeros((0, 3), dtype=float)
+        if self._apex_loop is not None and len(self._apex_loop) > 0:
+            extra_anchors = detect_rim_local_minima(
+                self._apex_loop, self._display_matrix,
+                existing_anchors_print=anchors_print,
+                xy_radius_mm=2.0, min_dip_mm=0.05, dedupe_dist_mm=0.5,
+            )
+        if len(extra_anchors) > 0:
+            all_anchors = np.vstack([anchors_print, extra_anchors])
+        else:
+            all_anchors = anchors_print
+
         self.pillars_mesh = generate_pillars_to_plane(
-            anchors_print, 0.0, self.pillar_params
+            all_anchors, 0.0, self.pillar_params
         )
         if self.pillars_mesh is not None:
             print(
-                f"[qt_viewer] pillars→raft: {len(self.anchors)} kotwic → "
+                f"[qt_viewer] pillars→raft: {len(anchors_print)} kotwic + "
+                f"{len(extra_anchors)} minima → {len(all_anchors)} total → "
                 f"{len(self.pillars_mesh.vertices)}v / {len(self.pillars_mesh.faces)}f"
             )
 
@@ -1332,6 +1506,13 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self._apply_display_matrix()
         self._recompute_pillars()
         self._refresh_pillars()
+        self._recompute_braces()
+        self._refresh_braces()
+        self._recompute_raft()
+        self._refresh_raft()
+        # overhang OSTATNI — wymaga pillarów i raftu
+        self._recompute_overhang()
+        self._refresh_overhang()
         self._refresh_ground()
         self.plotter.reset_camera()
         self.plotter.render()
@@ -1340,6 +1521,9 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         )
 
     def _on_tilt_change(self, v):
+        """LIVE: tanie elementy (pillary, łączniki, raft, ground). Overhang
+        (wolny layer-sweep ~1-3s) odpala się dopiero na RELEASE — patrz
+        `_on_tilt_release`."""
         self._tilt_angle = float(v)
         if not self._print_view or self.aligner_mesh is None:
             return
@@ -1347,8 +1531,416 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self._apply_display_matrix()
         self._recompute_pillars()
         self._refresh_pillars()
+        self._recompute_braces()
+        self._refresh_braces()
+        self._recompute_raft()
+        self._refresh_raft()
         self._refresh_ground()
         self.plotter.render()
+
+    def _on_tilt_release(self, v):
+        """Po puszczeniu slidera nachylenia: przelicz overhang (wolne)."""
+        if not self._print_view:
+            return
+        self._recompute_overhang()
+        self._refresh_overhang()
+
+    def _optimize_tilt(self):
+        """**Auto-optymalizacja nachylenia** druku: sweep -50..+50°, minimalizuj
+        overhang na ścianach **poza rim** (powierzchnia okluzyjna / fit).
+
+        Metryka szybka (face-normal · -Z_print, O(F) per kąt). Rim dostaje
+        podpory niezależnie od kąta — optymalizujemy resztę powierzchni żeby
+        nie drukowała się w powietrzu.
+        """
+        from .supports import optimize_tilt_for_min_overhang
+
+        if self.aligner_mesh is None:
+            print("[qt_viewer] optymalizacja tilta: brak nakładki (najpierw Generuj)")
+            return
+        if self._ap_frame is None:
+            self._ensure_print_transform()
+        if self._ap_frame is None:
+            print("[qt_viewer] optymalizacja tilta: brak ramy AP")
+            return
+        try:
+            best, angles, scores = optimize_tilt_for_min_overhang(
+                self.aligner_mesh,
+                self._ap_frame,
+                tilt_range_deg=(-50.0, 50.0),
+                n_steps=51,                   # 1° krok
+                exclude_vertex_mask=self.rim_mask,
+                overhang_angle_deg=self._overhang_angle,
+                weight_by_area=True,
+                z_gap=2.0,
+            )
+        except Exception as e:
+            print(f"[qt_viewer] optymalizacja tilta error: {e}")
+            return
+        # Top 5 kątów dla wglądu
+        top5 = np.argsort(scores)[:5]
+        print(
+            "[qt_viewer] top 5 kątów (najmniej overhangu):  "
+            + ",  ".join(
+                f"{angles[i]:+.0f}°={scores[i]:.0f}mm²" for i in top5
+            )
+        )
+        # Włącz widok druku PRZED ustawieniem slidera (toggle_print_view
+        # nadpisuje overhang i konfigure aktorów)
+        if not self._print_view:
+            self._toggle_print_view()
+        # Ustaw slider — wyzwoli _on_tilt_change (live: pillary/raft/braces)
+        self.sl_tilt.setValue(float(best))
+        # Programmatic setValue NIE emituje valueChangedFinal — overhang
+        # przeliczamy ręcznie.
+        self._recompute_overhang()
+        self._refresh_overhang()
+
+    # ---------- S4: raft ----------
+    def _recompute_raft(self):
+        """Raft pod pillarami w print space (płyta na Z=0). Tylko w widoku druku."""
+        from .supports import make_raft, transform_points
+
+        if self.anchors is None or not self._print_view:
+            self.raft_mesh = None
+            return
+        anchors_print = transform_points(self.anchors, self._display_matrix)
+        self.raft_mesh = make_raft(
+            anchors_print, z_top=0.0, thickness=self._raft_thickness,
+            band_width=self._raft_band_width,
+            solid_disk=self._raft_solid_disk,
+        )
+
+    def _refresh_raft(self):
+        if self._raft_actor is not None:
+            self.plotter.remove_actor(self._raft_actor, render=False)
+            self._raft_actor = None
+        if self.raft_mesh is None or not self._act_show_raft.isChecked():
+            self.plotter.render()
+            return
+        faces_flat = np.hstack(
+            [np.full((len(self.raft_mesh.faces), 1), 3, dtype=np.int64),
+             self.raft_mesh.faces]
+        ).ravel()
+        poly = pv.PolyData(np.asarray(self.raft_mesh.vertices), faces_flat)
+        self._raft_actor = self.plotter.add_mesh(
+            poly,
+            color="#b45309",   # ciemny pomarańcz — spójny z pillarami, ciemniejszy
+            smooth_shading=False,
+            name="raft_actor",
+            reset_camera=False,
+        )
+        self.plotter.render()
+
+    def _toggle_raft_visibility(self):
+        self._refresh_raft()
+
+    def _on_raft_thick_change(self, v):
+        self._raft_thickness = float(v)
+        if self._print_view:
+            self._recompute_raft()
+            self._refresh_raft()
+
+    def _on_raft_width_change(self, v):
+        self._raft_band_width = float(v)
+        if self._print_view:
+            self._recompute_raft()
+            self._refresh_raft()
+
+    def _on_drainage_change(self, v):
+        """Drainage hole radius — stosowany dopiero podczas eksportu
+        (boolean operacja jest wolna, nie chcemy live recompute)."""
+        self._drainage_hole_radius = float(v)
+
+    def _on_raft_solid_change(self, state):
+        """Toggle solid disk raft vs U-band. Live recompute raftu w widoku druku."""
+        self._raft_solid_disk = bool(state)
+        if self._print_view:
+            self._recompute_raft()
+            self._refresh_raft()
+
+    # ---------- S4.5: łączniki (zigzag bracing) ----------
+    def _recompute_braces(self):
+        """Zigzag cross-bracing między pillarami w print space. Tylko w widoku druku."""
+        from .supports import generate_braces, transform_points
+
+        if self.anchors is None or not self._print_view:
+            self.braces_mesh = None
+            return
+        anchors_print = transform_points(self.anchors, self._display_matrix)
+        self.braces_mesh = generate_braces(
+            anchors_print, self.pillar_params,
+            brace_angle_deg=self._brace_angle,
+            brace_diameter=self._brace_diameter,
+        )
+
+    def _refresh_braces(self):
+        if self._braces_actor is not None:
+            self.plotter.remove_actor(self._braces_actor, render=False)
+            self._braces_actor = None
+        if self.braces_mesh is None or not self._act_show_braces.isChecked():
+            self.plotter.render()
+            return
+        faces_flat = np.hstack(
+            [np.full((len(self.braces_mesh.faces), 1), 3, dtype=np.int64),
+             self.braces_mesh.faces]
+        ).ravel()
+        poly = pv.PolyData(np.asarray(self.braces_mesh.vertices), faces_flat)
+        self._braces_actor = self.plotter.add_mesh(
+            poly,
+            color="#fdba74",   # jasny pomarańcz — odróżnia od pillarów
+            smooth_shading=True,
+            name="braces_actor",
+            reset_camera=False,
+        )
+        self.plotter.render()
+
+    def _toggle_braces_visibility(self):
+        self._refresh_braces()
+
+    def _on_brace_angle_change(self, v):
+        self._brace_angle = float(v)
+        if self._print_view:
+            self._recompute_braces()
+            self._refresh_braces()
+
+    def _on_brace_dia_change(self, v):
+        self._brace_diameter = float(v)
+        if self._print_view:
+            self._recompute_braces()
+            self._refresh_braces()
+
+    # ---------- S5.5: overhangi ----------
+    def _recompute_overhang(self):
+        """**Dual overhang visualization:**
+          - 🟡 GEOMETRIC (pomarańczowy, półprzezr): ściany "patrzące w dół" pod
+            kątem > critical — *może* być ryzyko, ale cap wall często trzyma to
+            self-supportem (visual cue, intuicja overhangu).
+          - 🔴 SLICER-CONFIRMED (czerwony, solid): ściana patrzy w dół ORAZ pod
+            nią nic nie ma w warstwie poniżej (slicer-style detection — realne
+            ryzyko że drukuje w powietrzu).
+
+        Slicer-confirmed jest **podzbiorem** geometric (geometric = wszystkie
+        kandydaci, slicer = filtr "nie ma materiału poniżej w cot(angle)").
+        Dla typowej nakładki cap z rim w dół: red≈0 (cap self-supporting),
+        orange duży. Jeśli czerwień się pojawi → realny print risk.
+
+        Pillary tylko pod **slicer-confirmed** rim overhangami (real risk).
+        """
+        from .supports import (
+            detect_overhang_faces_slicer_check, generate_pillars_to_plane,
+            overhang_face_mask, transform_points,
+        )
+
+        self.overhang_pillars_mesh = None
+        self.overhang_anchors = None
+        self.overhang_faces_mesh = None
+        self.overhang_nonrim_faces_mesh = None
+        if self.aligner_mesh is None or not self._print_view:
+            return
+
+        # === 1. Geometric (per-face normal) — wszystkie pochyłe ściany ===
+        geometric_mask = overhang_face_mask(
+            self.aligner_mesh, self._display_matrix,
+            overhang_angle_deg=self._overhang_angle,
+        )
+        n_geom = int(geometric_mask.sum())
+
+        # === 2. Slicer-confirmed — geometric ORAZ no material below ===
+        try:
+            slicer_mask = detect_overhang_faces_slicer_check(
+                self.aligner_mesh,
+                self._display_matrix,
+                pillars_mesh=self.pillars_mesh,
+                raft_mesh=self.raft_mesh,
+                overhang_angle_deg=self._overhang_angle,
+                voxel_size=0.5,
+            )
+        except Exception as e:
+            print(f"[qt_viewer] overhang slicer-check error: {e}")
+            slicer_mask = np.zeros(len(self.aligner_mesh.faces), dtype=bool)
+        n_slicer = int(slicer_mask.sum())
+
+        # geometric_only = geometric ale supported below (NIE prawdziwy risk, tylko viz)
+        geometric_only_mask = geometric_mask & ~slicer_mask
+
+        # === 3. Submesh dla wizualizacji ===
+        # POMARAŃCZ półprzezroczysty: wszystkie geometric (włącznie z confirmed
+        # — żeby user widział TWO LAYERS warto pokazać slicer-confirmed JAKO red
+        # NAD pomarańczem, nie tylko obok; więc pomarańcz = geometric_only).
+        if int(geometric_only_mask.sum()) > 0:
+            sub = self.aligner_mesh.submesh(
+                [np.where(geometric_only_mask)[0]], append=True
+            ).copy()
+            sub.vertices = sub.vertices + sub.vertex_normals * 0.5
+            self.overhang_nonrim_faces_mesh = sub  # reuse field jako "geometric_only"
+        # CZERWIEŃ solid: slicer-confirmed (real risk)
+        if n_slicer > 0:
+            sub = self.aligner_mesh.submesh(
+                [np.where(slicer_mask)[0]], append=True
+            ).copy()
+            sub.vertices = sub.vertices + sub.vertex_normals * 0.5
+            self.overhang_faces_mesh = sub
+
+        print(
+            f"[qt_viewer] overhang: geometric={n_geom} (pochyłe), "
+            f"slicer-confirmed={n_slicer} (real risk = patrzy w dół I nic poniżej). "
+            f"{n_geom - n_slicer} ścian wzdłuż self-supporting cap wall — "
+            f"NIE są realnym ryzykiem, tylko wizualnym cue."
+        )
+
+        # === 4. Pillary tylko pod slicer-confirmed RIM overhangami ===
+        if n_slicer == 0:
+            return
+        if self.rim_mask is not None:
+            face_verts = np.asarray(self.aligner_mesh.faces)
+            rim_touches = self.rim_mask[face_verts].any(axis=1)
+            rim_over_mask = slicer_mask & rim_touches
+        else:
+            rim_over_mask = slicer_mask
+        n_rim_real = int(rim_over_mask.sum())
+        if n_rim_real == 0:
+            return
+
+        # === Pillary pod slicer-confirmed RIM overhangami ===
+        if self.raft_mesh is not None and len(self.raft_mesh.vertices) > 0:
+            target_z = float(self.raft_mesh.bounds[1, 2])
+        else:
+            target_z = 0.0
+
+        fc = np.asarray(self.aligner_mesh.triangles_center)[rim_over_mask]
+        fc_print = transform_points(fc, self._display_matrix)
+        min_h = 1.5
+        fc_print = fc_print[fc_print[:, 2] > target_z + min_h]
+        if len(fc_print) == 0:
+            return
+
+        # Grid downsample
+        spacing = 3.0
+        keys = np.floor(fc_print[:, :2] / spacing).astype(np.int64)
+        _, idx = np.unique(keys, axis=0, return_index=True)
+        anchors = fc_print[idx]
+
+        # Dedupe vs istniejące rim pillary
+        if self.anchors is not None and len(self.anchors) > 0:
+            from scipy.spatial import cKDTree
+            existing_print = transform_points(self.anchors, self._display_matrix)
+            d, _ = cKDTree(existing_print).query(anchors[:, :2], k=1)
+            anchors = anchors[d > 2.0]
+
+        if len(anchors) == 0:
+            print(
+                "[qt_viewer] overhang pillars: 0 nowych (rim overhangi już "
+                "pokryte istniejącymi pillarami)"
+            )
+            return
+
+        pillars_mesh = generate_pillars_to_plane(
+            anchors, target_z, self.pillar_params, verbose=False,
+        )
+        self.overhang_pillars_mesh = pillars_mesh
+        self.overhang_anchors = anchors
+        print(
+            f"[qt_viewer] overhang pillars: {len(anchors)} nowych (po dedupe "
+            f"vs {len(self.anchors) if self.anchors is not None else 0} istniejących)"
+        )
+
+    def _refresh_overhang(self):
+        for attr in (
+            "_overhang_faces_actor", "_overhang_nonrim_faces_actor",
+            "_overhang_pillars_actor",
+        ):
+            a = getattr(self, attr, None)
+            if a is not None:
+                self.plotter.remove_actor(a, render=False)
+                setattr(self, attr, None)
+        if not self._print_view or not self._act_show_overhang.isChecked():
+            self._set_aligner_opacity_for_overhang(False)
+            self.plotter.render()
+            return
+        # Helper: render submesh w flat-unshaded color z polygon offset
+        def _add_overhang_layer(mesh, color, name, edge_color, opacity, line_width):
+            if mesh is None:
+                return None
+            ff = np.hstack(
+                [np.full((len(mesh.faces), 1), 3, dtype=np.int64), mesh.faces]
+            ).ravel()
+            poly = pv.PolyData(np.asarray(mesh.vertices), ff)
+            act = self.plotter.add_mesh(
+                poly, color=color, opacity=opacity,
+                lighting=False,
+                show_edges=(opacity >= 0.9),
+                edge_color=edge_color, line_width=line_width,
+                name=name, reset_camera=False,
+            )
+            try:
+                mapper = act.GetMapper()
+                mapper.SetResolveCoincidentTopologyToPolygonOffset()
+                mapper.SetResolveCoincidentTopologyPolygonOffsetParameters(-2.0, -2.0)
+            except Exception:
+                pass
+            self._set_matrix(act)
+            return act
+
+        # 🟡 POMARAŃCZ półprzezr (geometric_only — pochyłe ALE supported below)
+        # Visual cue dla intuicji overhangu; NIE realne ryzyko
+        self._overhang_nonrim_faces_actor = _add_overhang_layer(
+            self.overhang_nonrim_faces_mesh,
+            color="#ff9100", name="overhang_nonrim_faces",
+            edge_color="#3a1500", opacity=0.55, line_width=1.0,
+        )
+        # 🔴 CZERWIEŃ solid (slicer-confirmed — REAL print risk)
+        self._overhang_faces_actor = _add_overhang_layer(
+            self.overhang_faces_mesh,
+            color="#ff0033", name="overhang_faces",
+            edge_color="#000000", opacity=1.0, line_width=2.5,
+        )
+
+        # Aligner przezroczysty żeby widać było overhang wewnątrz cap-u
+        if (self.overhang_faces_mesh is not None
+                or self.overhang_nonrim_faces_mesh is not None):
+            self._set_aligner_opacity_for_overhang(True)
+        else:
+            self._set_aligner_opacity_for_overhang(False)
+
+        # Czerwone priorytetowe podpory (już w print space)
+        if self.overhang_pillars_mesh is not None:
+            pm = self.overhang_pillars_mesh
+            ff = np.hstack(
+                [np.full((len(pm.faces), 1), 3, dtype=np.int64), pm.faces]
+            ).ravel()
+            poly = pv.PolyData(np.asarray(pm.vertices), ff)
+            self._overhang_pillars_actor = self.plotter.add_mesh(
+                poly, color="#dc2626", smooth_shading=True,
+                name="overhang_pillars", reset_camera=False,
+            )
+        self.plotter.render()
+
+    def _toggle_overhang_visibility(self):
+        self._refresh_overhang()
+
+    def _set_aligner_opacity_for_overhang(self, overhang_on: bool):
+        """Aligner przezroczysty (0.25) gdy overhang widoczny → widzisz
+        czerwone obszary WEWNĄTRZ cap-u (np. inverted cusps które patrzą w dół
+        w print space). Pełna opacity (`self._aligner_opacity`) gdy overhang
+        wyłączony.
+
+        Bezpieczne na brak aktora — early-return jeśli aligner jeszcze nie
+        wyrenderowany.
+        """
+        if self._aligner_actor is None:
+            return
+        try:
+            target = 0.25 if overhang_on else float(self._aligner_opacity)
+            self._aligner_actor.GetProperty().SetOpacity(target)
+        except Exception:
+            pass
+
+    def _on_overhang_angle_change(self, v):
+        self._overhang_angle = float(v)
+        if self._print_view:
+            self._recompute_overhang()
+            self._refresh_overhang()
 
     def _toggle_mesh_visibility(self):
         if self._mesh_actor is None:
@@ -1367,12 +1959,146 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         default_name = OUTPUT_DIR / f"{self.loaded.stl_path.stem}_aligner.stl"
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
-            self, "Eksport STL", str(default_name), "STL (*.stl)"
+            self, "Eksport nakładki (STL)", str(default_name), "STL (*.stl)"
         )
         if not path:
             return
         self.aligner_mesh.export(path)
-        print(f"[qt_viewer] Zapisano: {path}")
+        print(f"[qt_viewer] Zapisano nakładkę: {path}")
+
+    def _export_print_assembly(self):
+        """**Export gotowego do druku zestawu** — nakładka + pillary + braces +
+        raft + overhang pillary, wszystko w print space (po nachyleniu i
+        translacji do Z=0=build plate).
+
+        Multi-solid STL via `trimesh.util.concatenate` (NIE boolean union —
+        slicer drukarki obsługuje multiple disjoint manifold bodies; konkatenacja
+        nigdy nie zawodzi tak jak boolean na edge case'ach).
+
+        Walidacje:
+          - sprawdza czy aligner istnieje (warunek bazowy),
+          - print transform → potrzebuje `_ap_frame` (PCA detection) — auto-build,
+          - sprawdza i loguje watertight/manifold każdej bryły,
+          - sprawdza fit w typowym build volume (Formlabs 145×145×185mm).
+        """
+        if self.aligner_mesh is None:
+            print("[qt_viewer] Brak nakładki — wygeneruj najpierw (N).")
+            return
+        if self.anchors is None or len(self.anchors) == 0:
+            print(
+                "[qt_viewer] Brak kotwic rim — sprawdź czy apex_loop się "
+                "wygenerował. Eksport bez pillarów byłby niedrukowalny."
+            )
+            return
+
+        # Upewnij się że mamy print transform
+        T = self._ensure_print_transform()
+        if T is None:
+            print("[qt_viewer] Brak print transform — nie mogę zorientować.")
+            return
+
+        from .supports import (
+            add_drainage_hole, cut_raft_drain_hole, transform_points,
+        )
+        import trimesh
+
+        # 1. Aligner: opcjonalnie drainage hole, potem → print space
+        aligner_src = self.aligner_mesh
+        raft_src = self.raft_mesh
+        if self._drainage_hole_radius > 0:
+            print(
+                f"[qt_viewer] dodaję drainage hole r={self._drainage_hole_radius:.2f}mm "
+                f"(boolean ~1-2s na aligner + raft)..."
+            )
+            aligner_src = add_drainage_hole(
+                self.aligner_mesh,
+                transform=np.asarray(T, dtype=float),
+                hole_radius_mm=self._drainage_hole_radius,
+                hole_depth_mm=10.0,
+            )
+            # Ten sam tunel przez raft (U-band cavity drenowanie)
+            if raft_src is not None and len(raft_src.vertices) > 0:
+                raft_src = cut_raft_drain_hole(
+                    raft_src, self.aligner_mesh,
+                    transform=np.asarray(T, dtype=float),
+                    hole_radius_mm=self._drainage_hole_radius,
+                )
+        aligner_print = aligner_src.copy()
+        aligner_print.apply_transform(np.asarray(T, dtype=float))
+
+        # 2. Pozostałe są już w print space (generowane z anchors_print)
+        # Jeśli któryś nie istnieje (np. user wyłączył braces), pomijamy.
+        components: list[tuple[str, trimesh.Trimesh]] = [
+            ("aligner", aligner_print),
+        ]
+        if self.pillars_mesh is not None and len(self.pillars_mesh.vertices) > 0:
+            components.append(("pillars (rim)", self.pillars_mesh))
+        if self.braces_mesh is not None and len(self.braces_mesh.vertices) > 0:
+            components.append(("braces", self.braces_mesh))
+        # Użyj raft_src (z drainage hole jeśli włączony) zamiast self.raft_mesh
+        if raft_src is not None and len(raft_src.vertices) > 0:
+            components.append(("raft", raft_src))
+        if (
+            self.overhang_pillars_mesh is not None
+            and len(self.overhang_pillars_mesh.vertices) > 0
+        ):
+            components.append(("overhang pillars", self.overhang_pillars_mesh))
+
+        # 3. Walidacja per komponent
+        total_v, total_f = 0, 0
+        print("[qt_viewer] === walidacja komponentów eksportu ===")
+        for name, m in components:
+            is_wt = bool(m.is_watertight)
+            is_manif = bool(m.is_winding_consistent)
+            total_v += len(m.vertices)
+            total_f += len(m.faces)
+            flag = "✓" if (is_wt and is_manif) else "⚠"
+            print(
+                f"  {flag} {name:18s}: {len(m.vertices):6d} v / "
+                f"{len(m.faces):6d} f, watertight={is_wt}, winding_ok={is_manif}"
+            )
+
+        # 4. Konkatenacja (multi-solid; slicer rozdzieli connected components)
+        combined = trimesh.util.concatenate([m for _, m in components])
+        print(
+            f"[qt_viewer] zestaw total: {len(combined.vertices)} v / "
+            f"{len(combined.faces)} f ({len(components)} brył)"
+        )
+
+        # 5. Build volume check (Formlabs Form 3/3B = 145×145×185 mm)
+        bb = combined.bounds
+        dims = bb[1] - bb[0]
+        BUILD_VOLUME = np.array([145.0, 145.0, 185.0])
+        print(
+            f"[qt_viewer] bounding box: "
+            f"{dims[0]:.1f} × {dims[1]:.1f} × {dims[2]:.1f} mm "
+            f"(z {bb[0][2]:+.1f}..{bb[1][2]:+.1f})"
+        )
+        oversize = dims > BUILD_VOLUME
+        if oversize.any():
+            axes = [a for a, o in zip("XYZ", oversize) if o]
+            print(
+                f"  ⚠ UWAGA: zestaw przekracza Formlabs Form 3 build volume "
+                f"(145×145×185 mm) w osiach: {','.join(axes)}. "
+                f"Asiga Pro 4K = 124×70×200 — sprawdź u siebie."
+            )
+
+        # 6. Zapis
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        default_name = OUTPUT_DIR / f"{self.loaded.stl_path.stem}_print_ready.stl"
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self, "Eksport do druku (multi-solid STL)",
+            str(default_name), "STL (*.stl)",
+        )
+        if not path:
+            print("[qt_viewer] Eksport anulowany.")
+            return
+        combined.export(path)
+        print(
+            f"[qt_viewer] ✓ Zapisano print-ready STL: {path}\n"
+            f"  Otwórz w PreForm / Composer z auto-support OFF — geometria "
+            f"podpor już w pliku."
+        )
 
     # =====================================================================
     # save / load selekcji / wczytaj STL
