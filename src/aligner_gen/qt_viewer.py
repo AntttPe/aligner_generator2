@@ -593,18 +593,17 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         )
         self.sl_raft_thick.valueChanged.connect(self._on_raft_thick_change)
         f7.addWidget(self.sl_raft_thick)
-        # Drainage hole (anty "Cup Detected" w PreForm) — promień otworu
-        # na szczycie cap-u w print Z. 0 = wyłączony. Dodaje się tylko
-        # podczas eksportu (boolean — wolny, ~0.5-2s).
+        # Vertical drain przez SOLID DISK raft (tylko gdy checkbox włączony).
+        # Cap NIE jest wiercony — clinical no-no dla aligner thin-shell.
+        # Cap interior drenuje przez gapy między pillarami na rim.
         self.sl_drainage = LabeledSlider(
-            "Drainage hole (promień)", 0.0, 2.5, self._drainage_hole_radius, 0.25,
+            "Otwór w rafcie (solid disk)", 0.0, 2.5, self._drainage_hole_radius, 0.25,
             decimals=2, suffix=" mm",
         )
         self.sl_drainage.setToolTip(
-            "Otwór drenażowy na szczycie cap-u w print Z — likwiduje "
-            "PreForm \"Cup Detected\" (trapped resin). 0 = wyłączony. "
-            "Klinicznie standardowe ~1.5mm radius (3mm Ø). Stosowany podczas "
-            "eksportu do druku."
+            "Pionowy otwór drenażowy przez **solid disk raft** (działa TYLKO "
+            "gdy checkbox 'Raft jako pełny disk' włączony). Cap NIE jest "
+            "wiercony — clinical no-no. 0 = bez otworu w rafcie."
         )
         self.sl_drainage.valueChanged.connect(self._on_drainage_change)
         f7.addWidget(self.sl_drainage)
@@ -619,8 +618,18 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self.cb_raft_solid.stateChanged.connect(self._on_raft_solid_change)
         f7.addWidget(self.cb_raft_solid)
         self.sl_raft_width = LabeledSlider(
-            "Szerokość wstęgi raftu", 2.0, 8.0, self._raft_band_width, 0.5,
+            "Szerokość wstęgi raftu", 2.0, 15.0, self._raft_band_width, 0.5,
             decimals=1, suffix=" mm",
+        )
+        self.sl_raft_width.setToolTip(
+            "Szerokość U-band raftu (od inner do outer edge).\n"
+            "  4mm  = thin band (default, oszczędza resin, cup warning)\n"
+            "  8mm  = wider band (mocniejsza baza, cup warning)\n"
+            "  12-15mm = thick filled-U feel (więcej resinu pod nakładką,\n"
+            "    ale tongue space dalej empty — vs solid disk).\n"
+            "UWAGA: wide band + tight molar curve → inner rail może\n"
+            "pinchować. Cup PreForm zostaje (inner edge band-u zamknięta\n"
+            "pętla). Aby usunąć cup → checkbox 'Raft jako pełny disk'."
         )
         self.sl_raft_width.valueChanged.connect(self._on_raft_width_change)
         f7.addWidget(self.sl_raft_width)
@@ -1997,32 +2006,34 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             print("[qt_viewer] Brak print transform — nie mogę zorientować.")
             return
 
-        from .supports import (
-            add_drainage_hole, cut_raft_drain_hole, transform_points,
-        )
+        from .supports import cut_raft_drain_hole, transform_points
         import trimesh
 
-        # 1. Aligner: opcjonalnie drainage hole, potem → print space
+        # 1. Aligner: bez drilling (cap-side hole = clinical no-no, niszczy
+        # powierzchnię okluzyjną nakładki). Cap interior drenuje NATURALNIE
+        # przez gapy między pillarami na rim. Cup detection w PreForm dla cap-u
+        # to strict mode — funkcjonalnie ten drenaż działa.
         aligner_src = self.aligner_mesh
         raft_src = self.raft_mesh
-        if self._drainage_hole_radius > 0:
+
+        # Vertical drain TYLKO przez solid disk raft (jeśli user włączył).
+        # Dla U-band: cup-fix przez solid disk checkbox (brak cavity), nie przez
+        # drilling rafta (cylinder przypadkowo nad pillarem = ryzyko collapse).
+        if (
+            self._drainage_hole_radius > 0
+            and self._raft_solid_disk
+            and raft_src is not None
+            and len(raft_src.vertices) > 0
+        ):
             print(
-                f"[qt_viewer] dodaję drainage hole r={self._drainage_hole_radius:.2f}mm "
-                f"(boolean ~1-2s na aligner + raft)..."
+                f"[qt_viewer] drilling raft body r={self._drainage_hole_radius:.2f}mm "
+                f"(boolean ~0.5s)..."
             )
-            aligner_src = add_drainage_hole(
-                self.aligner_mesh,
+            raft_src = cut_raft_drain_hole(
+                raft_src, self.aligner_mesh,
                 transform=np.asarray(T, dtype=float),
                 hole_radius_mm=self._drainage_hole_radius,
-                hole_depth_mm=10.0,
             )
-            # Ten sam tunel przez raft (U-band cavity drenowanie)
-            if raft_src is not None and len(raft_src.vertices) > 0:
-                raft_src = cut_raft_drain_hole(
-                    raft_src, self.aligner_mesh,
-                    transform=np.asarray(T, dtype=float),
-                    hole_radius_mm=self._drainage_hole_radius,
-                )
         aligner_print = aligner_src.copy()
         aligner_print.apply_transform(np.asarray(T, dtype=float))
 
@@ -2044,25 +2055,35 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         ):
             components.append(("overhang pillars", self.overhang_pillars_mesh))
 
-        # 3. Walidacja per komponent
+        # 3. Walidacja per komponent + objętość resinu
         total_v, total_f = 0, 0
+        total_volume_mm3 = 0.0
         print("[qt_viewer] === walidacja komponentów eksportu ===")
         for name, m in components:
             is_wt = bool(m.is_watertight)
             is_manif = bool(m.is_winding_consistent)
             total_v += len(m.vertices)
             total_f += len(m.faces)
+            # Objętość — tylko dla watertight (inaczej trimesh nie liczy poprawnie)
+            try:
+                vol = float(abs(m.volume)) if is_wt else 0.0
+            except Exception:
+                vol = 0.0
+            total_volume_mm3 += vol
             flag = "✓" if (is_wt and is_manif) else "⚠"
             print(
                 f"  {flag} {name:18s}: {len(m.vertices):6d} v / "
-                f"{len(m.faces):6d} f, watertight={is_wt}, winding_ok={is_manif}"
+                f"{len(m.faces):6d} f, watertight={is_wt}, "
+                f"winding={is_manif}, vol={vol/1000.0:.2f} ml"
             )
 
         # 4. Konkatenacja (multi-solid; slicer rozdzieli connected components)
         combined = trimesh.util.concatenate([m for _, m in components])
         print(
             f"[qt_viewer] zestaw total: {len(combined.vertices)} v / "
-            f"{len(combined.faces)} f ({len(components)} brył)"
+            f"{len(combined.faces)} f ({len(components)} brył), "
+            f"objętość ≈ {total_volume_mm3/1000.0:.2f} ml "
+            f"({total_volume_mm3:.0f} mm³)"
         )
 
         # 5. Build volume check (Formlabs Form 3/3B = 145×145×185 mm)
@@ -2099,6 +2120,14 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             f"  Otwórz w PreForm / Composer z auto-support OFF — geometria "
             f"podpor już w pliku."
         )
+        # Hint dla użytkownika gdy raft U-band → PreForm flag-uje Cup Detected
+        if not self._raft_solid_disk:
+            print(
+                "  💡 PreForm \"Cup Detected\" na wewnętrznej krawędzi raftu? "
+                "Włącz checkbox 'Raft jako pełny disk (anti-cup)' "
+                "w panelu Orientacja druku → wypełnia środek U-bandu "
+                "→ likwiduje cavity (+~0.5ml resinu)."
+            )
 
     # =====================================================================
     # save / load selekcji / wczytaj STL

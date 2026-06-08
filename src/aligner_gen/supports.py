@@ -494,6 +494,12 @@ class PillarParams:
                                      # gdy rim się odchyla). Plus sphere-cone
                                      # joint = naturalny stress riser dla
                                      # clean snap-off (Formlabs-style).
+    foot_height: float = 0.4         # mm — wysokość poszerzenia przy rafcie
+                                     # (rounded fillet z 90° junction → silniejsza
+                                     # mechanika podstawy, mniej shear failure
+                                     # przy starcie druku gdy pillary cienki).
+    foot_extra_radius: float = 0.25  # mm — extra promień foot przy rafcie
+                                     # (body_d/2 + foot_extra). 0 = wyłączone.
     pillar_height: float = 8.0   # mm — całkowita długość pillara (S4 ustawi do raftu)
     n_sides: int = 8             # ilość boków cylindra/stożka (8 = wystarczająco gładkie)
 
@@ -580,35 +586,75 @@ def _make_pillar(
     p1 = top_pt + params.tip_height * d
     p2 = top_pt + total_h * d
 
+    # Foot (rozszerzenie u podstawy → mocniejsza adhesja do raftu, brak ostrego
+    # 90° corner = mniejsze stress concentration podczas peel forces). Tylko
+    # gdy pillar jest dostatecznie długi (foot+tip ≤ total_h).
+    foot_h = float(getattr(params, "foot_height", 0.0))
+    foot_extra = float(getattr(params, "foot_extra_radius", 0.0))
+    use_foot = (
+        foot_h > 0 and foot_extra > 0
+        and total_h > params.tip_height + foot_h + 0.1
+    )
+    r_foot = r_bot + foot_extra
+
     ring0 = ring0_anchor + r_top * (ca[:, None] * u + sa[:, None] * w)
     ring1 = p1 + r_bot * (ca[:, None] * u + sa[:, None] * w)
-    ring2 = p2 + r_bot * (ca[:, None] * u + sa[:, None] * w)
+    if use_foot:
+        # ring1b: top of foot taper (cylinder body radius, foot_h above bottom)
+        # ring2: bottom of foot (wider radius, at p2 = raft level)
+        p_foot_top = p2 - foot_h * d   # = p2 + foot_h*(opposite dir_down) = wyżej w print Z
+        ring1b = p_foot_top + r_bot * (ca[:, None] * u + sa[:, None] * w)
+        ring2 = p2 + r_foot * (ca[:, None] * u + sa[:, None] * w)
+    else:
+        ring2 = p2 + r_bot * (ca[:, None] * u + sa[:, None] * w)
 
     # === Wersja A: ball-tip (manifold hemisphere SHARES ring0 with cone) ===
     if use_ball:
-        # Hemisphere top: ring_mid (theta=45°) + pole (theta=90°) → smooth dome
         r_ball = r_top
         cos45, sin45 = np.cos(np.radians(45.0)), np.sin(np.radians(45.0))
-        ring_mid_center = ring0_anchor - r_ball * sin45 * d   # góra w print Z
+        ring_mid_center = ring0_anchor - r_ball * sin45 * d
         ring_mid_radius = r_ball * cos45
         ring_mid = (
             ring_mid_center + ring_mid_radius * (ca[:, None] * u + sa[:, None] * w)
         )
-        pole_pt = ring0_anchor - r_ball * d                    # samo top sphere
+        pole_pt = ring0_anchor - r_ball * d
 
-        # verts layout: [ring0(n), ring1(n), ring2(n), ring_mid(n), pole(1), bot_center(1)]
-        verts = np.vstack([
-            ring0, ring1, ring2, ring_mid,
-            pole_pt[None, :], p2[None, :],
-        ])
-        ring_mid_off = 3 * n
-        pole_idx = 4 * n
-        bot_center_idx = 4 * n + 1
+        if use_foot:
+            verts = np.vstack([
+                ring0, ring1, ring1b, ring2, ring_mid,
+                pole_pt[None, :], p2[None, :],
+            ])
+            ring1b_off = 2 * n
+            ring2_off = 3 * n
+            ring_mid_off = 4 * n
+            pole_idx = 5 * n
+            bot_center_idx = 5 * n + 1
+        else:
+            verts = np.vstack([
+                ring0, ring1, ring2, ring_mid,
+                pole_pt[None, :], p2[None, :],
+            ])
+            ring1b_off = None
+            ring2_off = 2 * n
+            ring_mid_off = 3 * n
+            pole_idx = 4 * n
+            bot_center_idx = 4 * n + 1
     else:
-        # verts: [ring0(n), ring1(n), ring2(n), top_center(1), bot_center(1)]
-        verts = np.vstack([ring0, ring1, ring2, ring0_anchor[None, :], p2[None, :]])
-        top_center_idx = 3 * n
-        bot_center_idx = 3 * n + 1
+        if use_foot:
+            verts = np.vstack([
+                ring0, ring1, ring1b, ring2,
+                ring0_anchor[None, :], p2[None, :],
+            ])
+            ring1b_off = 2 * n
+            ring2_off = 3 * n
+            top_center_idx = 4 * n
+            bot_center_idx = 4 * n + 1
+        else:
+            verts = np.vstack([ring0, ring1, ring2, ring0_anchor[None, :], p2[None, :]])
+            ring1b_off = None
+            ring2_off = 2 * n
+            top_center_idx = 3 * n
+            bot_center_idx = 3 * n + 1
 
     faces: list[list[int]] = []
     # side cone (ring0 → ring1) — wspólne dla obu wariantów
@@ -616,11 +662,18 @@ def _make_pillar(
         j = (i + 1) % n
         faces.append([i, j, n + j])
         faces.append([i, n + j, n + i])
-    # side cylinder (ring1 → ring2)
+    # side cylinder (ring1 → ring1b lub ring2)
+    next_ring_off = ring1b_off if use_foot else ring2_off
     for i in range(n):
         j = (i + 1) % n
-        faces.append([n + i, n + j, 2 * n + j])
-        faces.append([n + i, 2 * n + j, 2 * n + i])
+        faces.append([n + i, n + j, next_ring_off + j])
+        faces.append([n + i, next_ring_off + j, next_ring_off + i])
+    # Foot flare (ring1b → ring2) — tylko gdy use_foot
+    if use_foot:
+        for i in range(n):
+            j = (i + 1) % n
+            faces.append([ring1b_off + i, ring1b_off + j, ring2_off + j])
+            faces.append([ring1b_off + i, ring2_off + j, ring2_off + i])
 
     if use_ball:
         # Hemisphere quads: ring0 → ring_mid (lower latitude)
@@ -638,10 +691,10 @@ def _make_pillar(
             j = (i + 1) % n
             faces.append([top_center_idx, i, j])
 
-    # bottom cap (większy krążek, facing dir_down)
+    # bottom cap (krążek r_foot lub r_bot, facing dir_down)
     for i in range(n):
         j = (i + 1) % n
-        faces.append([bot_center_idx, 2 * n + j, 2 * n + i])
+        faces.append([bot_center_idx, ring2_off + j, ring2_off + i])
 
     mesh = trimesh.Trimesh(
         vertices=verts,
@@ -1719,11 +1772,30 @@ def add_drainage_hole(
         height_above_mm=2.0, height_below_mm=float(hole_depth_mm),
     )
 
+    # Preprocess aligner — manifold3d wymaga `is_volume` (watertight + winding
+    # consistent + no self-intersections). Aligner z marching cubes + Taubin
+    # może mieć drobne self-intersections (lokalne fold-overy po smoothingu)
+    # → fail. trimesh.process() merguje duplicate verts, usuwa degenerate
+    # faces, naprawia winding.
+    aligner_clean = aligner_mesh.copy()
     try:
-        result = trimesh.boolean.difference([aligner_mesh, cyl])
+        aligner_clean.process(validate=True)
+        aligner_clean.merge_vertices()
+        if not aligner_clean.is_winding_consistent:
+            trimesh.repair.fix_normals(aligner_clean)
+    except Exception:
+        pass
+
+    try:
+        result = trimesh.boolean.difference([aligner_clean, cyl])
     except Exception as e:
         if verbose:
-            print(f"[supports] drainage hole: boolean FAILED ({e}) — bez otworu")
+            print(
+                f"[supports] drainage hole: boolean FAILED ({e}). "
+                f"is_volume={aligner_clean.is_volume}, "
+                f"watertight={aligner_clean.is_watertight}, "
+                f"winding={aligner_clean.is_winding_consistent}. Bez otworu."
+            )
         return aligner_mesh
 
     if verbose:
