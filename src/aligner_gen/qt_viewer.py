@@ -137,6 +137,16 @@ class LabeledSlider(QtWidgets.QWidget):
     def setValue(self, v: float):
         self.spin.setValue(v)
 
+    def setValueSilent(self, v: float):
+        """Ustaw wartość (spin + slider) BEZ emitowania valueChanged —
+        do aplikowania presetu bez kaskady recompute."""
+        self.spin.blockSignals(True)
+        self.slider.blockSignals(True)
+        self.spin.setValue(v)
+        self.slider.setValue(int(v * self._mult))
+        self.slider.blockSignals(False)
+        self.spin.blockSignals(False)
+
 
 # ===========================================================================
 # Custom interactor style: LMB picking, RMB rotate
@@ -242,8 +252,20 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         # S4: raft (płyta pod pillarami)
         self.raft_mesh = None                       # trimesh.Trimesh | None
         self._raft_actor = None
-        self._raft_thickness = 1.5                  # mm
+        self._raft_thickness = 0.8                  # mm — cienki: footprint, nie masa,
+                                                    # decyduje o adhezji ([[support-research-findings]])
         self._raft_band_width = 4.0                 # mm — szerokość wstęgi U
+        # Anti-peel taby: szerokie pady na ekstremach pętli (dystalne/przednie
+        # brzegi o największym momencie peel) → extra footprint przy cienkim rafcie
+        self._raft_anti_peel = True
+        self._raft_n_tabs = 4                       # ilość tabów (sektory kątowe)
+        self._raft_tab_radius = 2.5                 # mm — promień pada
+        # Adaptacyjne branch supports: dodatkowe kontakty (rim minima) realizowane
+        # jako krótkie gałęzie z głównych pillarów zamiast pełnych nóg (oszczędność
+        # resinu ~85% przy tym samym contact-grip — [[support-research-findings]])
+        self._branch_supports = True
+        self._branch_drop = 2.5                     # mm — origin gałęzi niżej od kontaktu
+        self._branch_strut_d = 0.6                  # mm — średnica strutu gałęzi
         # Drainage hole — likwiduje "Cup Detected" w PreForm dla wnętrza cap-u
         # 0 = wyłączony, >0 = promień otworu w mm na top occlusal w print Z
         self._drainage_hole_radius = 1.5            # mm (default 3mm Ø = klinicznie OK)
@@ -484,6 +506,29 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         f2.addWidget(self.sl_corridor)
         outer_lay.addWidget(g2)
 
+        # ----- Grupa: Presety drukarka + żywica -----
+        gp = QtWidgets.QGroupBox("Preset (drukarka + żywica)")
+        fp = QtWidgets.QVBoxLayout(gp)
+        self.cmb_preset = QtWidgets.QComboBox()
+        self._reload_preset_combo()
+        fp.addWidget(self.cmb_preset)
+        rowp = QtWidgets.QHBoxLayout()
+        self.btn_preset_apply = QtWidgets.QPushButton("Zastosuj")
+        self.btn_preset_apply.setToolTip(
+            "Załaduj parametry presetu (grubość, kontakt, raft, branch, orientacja).\n"
+            "Zmiana grubości/offsetu wymaga ponownego 'Generuj' — podpory live."
+        )
+        self.btn_preset_apply.clicked.connect(self._apply_selected_preset)
+        self.btn_preset_save = QtWidgets.QPushButton("Zapisz jako…")
+        self.btn_preset_save.setToolTip(
+            "Zapisz aktualne ustawienia jako nowy preset JSON w data/presets/."
+        )
+        self.btn_preset_save.clicked.connect(self._save_current_preset)
+        rowp.addWidget(self.btn_preset_apply)
+        rowp.addWidget(self.btn_preset_save)
+        fp.addLayout(rowp)
+        outer_lay.addWidget(gp)
+
         # ----- Grupa: Generacja nakładki -----
         g3 = QtWidgets.QGroupBox("Generacja nakładki")
         f3 = QtWidgets.QVBoxLayout(g3)
@@ -588,11 +633,28 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         self.btn_opt_tilt.clicked.connect(self._optimize_tilt)
         f7.addWidget(self.btn_opt_tilt)
         self.sl_raft_thick = LabeledSlider(
-            "Grubość raftu", 0.5, 4.0, self._raft_thickness, 0.5,
+            "Grubość raftu", 0.4, 2.0, self._raft_thickness, 0.1,
             decimals=1, suffix=" mm",
+        )
+        self.sl_raft_thick.setToolTip(
+            "Grubość raftu = czysty resin, NIE adhezja (tę daje footprint +\n"
+            "base layers w PreForm). Ścieniaj śmiało:\n"
+            "  0.7-0.8mm = sweet spot (−50% resinu raftu vs 1.5mm, fit bez zmian)\n"
+            "  1.5mm = stary default (ciężki, martwa masa)\n"
+            "Za cienki (<0.5mm) może się wyginać przy peel → użyj anti-peel tabów."
         )
         self.sl_raft_thick.valueChanged.connect(self._on_raft_thick_change)
         f7.addWidget(self.sl_raft_thick)
+        # Anti-peel taby — szerokie pady na dystalnych/przednich brzegach
+        self.cb_anti_peel = QtWidgets.QCheckBox("Anti-peel taby (dystalne)")
+        self.cb_anti_peel.setChecked(self._raft_anti_peel)
+        self.cb_anti_peel.setToolTip(
+            "Szerokie krążki-pady na ekstremach pętli (molary, przód) gdzie\n"
+            "moment peel jest największy → extra footprint do platformy bez\n"
+            "grubienia całego raftu. Pozwala ścienić raft bez ryzyka odklejenia."
+        )
+        self.cb_anti_peel.stateChanged.connect(self._on_anti_peel_change)
+        f7.addWidget(self.cb_anti_peel)
         # Vertical drain przez SOLID DISK raft (tylko gdy checkbox włączony).
         # Cap NIE jest wiercony — clinical no-no dla aligner thin-shell.
         # Cap interior drenuje przez gapy między pillarami na rim.
@@ -633,6 +695,17 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         )
         self.sl_raft_width.valueChanged.connect(self._on_raft_width_change)
         f7.addWidget(self.sl_raft_width)
+        # Adaptacyjne branch supports
+        self.cb_branch = QtWidgets.QCheckBox("Branch supports (gałęzie z pillarów)")
+        self.cb_branch.setChecked(self._branch_supports)
+        self.cb_branch.setToolTip(
+            "Dodatkowe kontakty (rim minima) jako krótkie GAŁĘZIE wychodzące z\n"
+            "najbliższych głównych pillarów zamiast pełnych nóg od raftu.\n"
+            "Industry-standard tree/branching: ten sam contact-grip, ~85% mniej\n"
+            "resinu na te kontakty. OFF = klasyczne pełne pillary dla minima."
+        )
+        self.cb_branch.stateChanged.connect(self._on_branch_change)
+        f7.addWidget(self.cb_branch)
         hint = QtWidgets.QLabel(
             "+ = przód (siekacze) do góry · − = przód nisko.\n"
             "Włącz „Widok druku\" [D] żeby zobaczyć."
@@ -1373,7 +1446,8 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         PreForm "Unsupported Minima Detected" flagi.
         """
         from .supports import (
-            detect_rim_local_minima, generate_pillars_to_plane, transform_points,
+            detect_rim_local_minima, generate_branch_supports,
+            generate_pillars_to_plane, transform_points,
         )
 
         if self.anchors is None or not self._print_view:
@@ -1393,19 +1467,36 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
                 existing_anchors_print=anchors_print,
                 xy_radius_mm=2.0, min_dip_mm=0.05, dedupe_dist_mm=0.5,
             )
-        if len(extra_anchors) > 0:
-            all_anchors = np.vstack([anchors_print, extra_anchors])
+        if self._branch_supports and len(extra_anchors) > 0:
+            # Główne pillary tylko z evenly-spaced kotwic; dodatkowe kontakty
+            # (rim minima) jako GAŁĘZIE z najbliższych głównych pillarów →
+            # ten sam contact-grip, ~85% mniej resinu niż pełne nogi.
+            main = generate_pillars_to_plane(anchors_print, 0.0, self.pillar_params)
+            branches = generate_branch_supports(
+                anchors_print, extra_anchors, target_z=0.0,
+                params=self.pillar_params,
+                branch_drop=self._branch_drop,
+                strut_diameter=self._branch_strut_d,
+            )
+            parts = [m for m in (main, branches) if m is not None]
+            self.pillars_mesh = (
+                trimesh.util.concatenate(parts) if parts else None
+            )
+            mode = f"{len(extra_anchors)} minima jako GAŁĘZIE"
         else:
-            all_anchors = anchors_print
-
-        self.pillars_mesh = generate_pillars_to_plane(
-            all_anchors, 0.0, self.pillar_params
-        )
+            all_anchors = (
+                np.vstack([anchors_print, extra_anchors])
+                if len(extra_anchors) > 0 else anchors_print
+            )
+            self.pillars_mesh = generate_pillars_to_plane(
+                all_anchors, 0.0, self.pillar_params
+            )
+            mode = f"{len(extra_anchors)} minima jako pełne pillary"
         if self.pillars_mesh is not None:
             print(
                 f"[qt_viewer] pillars→raft: {len(anchors_print)} kotwic + "
-                f"{len(extra_anchors)} minima → {len(all_anchors)} total → "
-                f"{len(self.pillars_mesh.vertices)}v / {len(self.pillars_mesh.faces)}f"
+                f"{mode} → {len(self.pillars_mesh.vertices)}v / "
+                f"{len(self.pillars_mesh.faces)}f"
             )
 
     def _refresh_pillars(self):
@@ -1618,6 +1709,8 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
             anchors_print, z_top=0.0, thickness=self._raft_thickness,
             band_width=self._raft_band_width,
             solid_disk=self._raft_solid_disk,
+            anti_peel_tabs=(self._raft_n_tabs if self._raft_anti_peel else 0),
+            tab_radius=self._raft_tab_radius,
         )
 
     def _refresh_raft(self):
@@ -1667,6 +1760,135 @@ class AlignerMainWindow(QtWidgets.QMainWindow):
         if self._print_view:
             self._recompute_raft()
             self._refresh_raft()
+
+    def _on_anti_peel_change(self, state):
+        """Toggle anti-peel taby. Live recompute raftu w widoku druku."""
+        self._raft_anti_peel = bool(state)
+        if self._print_view:
+            self._recompute_raft()
+            self._refresh_raft()
+
+    def _on_branch_change(self, state):
+        """Toggle branch supports. Live recompute pillarów w widoku druku."""
+        self._branch_supports = bool(state)
+        if self._print_view:
+            self._recompute_pillars()
+            self._refresh_pillars()
+
+    # ---------- Presety (drukarka + żywica) ----------
+    def _reload_preset_combo(self):
+        """Wypełnij combo presetów (built-in + zapisane w data/presets/)."""
+        from .presets import list_presets
+        self._presets_cache = list_presets()
+        self.cmb_preset.blockSignals(True)
+        self.cmb_preset.clear()
+        self.cmb_preset.addItems(list(self._presets_cache.keys()))
+        self.cmb_preset.blockSignals(False)
+
+    def _apply_selected_preset(self):
+        name = self.cmb_preset.currentText()
+        preset = getattr(self, "_presets_cache", {}).get(name)
+        if preset is None:
+            return
+        self._apply_preset(preset)
+
+    def _apply_preset(self, preset):
+        """Zaaplikuj preset na params/pillar_params/raft/branch + zsynchronizuj
+        widgety (bez kaskady recompute) i przelicz live podpory."""
+        # aligner (wymaga 'Generuj' by przeliczyć mesh)
+        self.params.thickness = preset.thickness
+        self.params.inner_clearance = preset.inner_clearance
+        self.params.voxel_pitch = preset.voxel_pitch
+        # kontakt / pillary
+        self.pillar_params.tip_diameter = preset.tip_diameter
+        self.pillar_params.body_diameter = preset.body_diameter
+        self.pillar_params.tip_penetration = preset.tip_penetration
+        self.pillar_params.use_ball_tip = preset.use_ball_tip
+        # raft
+        self._raft_thickness = preset.raft_thickness
+        self._raft_band_width = preset.raft_band_width
+        self._raft_anti_peel = preset.anti_peel_tabs > 0
+        if preset.anti_peel_tabs > 0:
+            self._raft_n_tabs = preset.anti_peel_tabs
+        # strategia podpór
+        self._branch_supports = preset.branch_supports
+        self._overhang_angle = preset.overhang_angle
+        self._anchor_spacing = preset.anchor_spacing
+
+        # sync widgetów bez emitowania (setValueSilent / blockSignals)
+        self.sl_thickness.setValueSilent(preset.thickness)
+        self.sl_offset.setValueSilent(preset.inner_clearance)
+        self.sl_tip_dia.setValueSilent(preset.tip_diameter)
+        self.sl_body_dia.setValueSilent(preset.body_diameter)
+        self.sl_raft_thick.setValueSilent(preset.raft_thickness)
+        self.sl_raft_width.setValueSilent(preset.raft_band_width)
+        self.sl_anchor_spacing.setValueSilent(preset.anchor_spacing)
+        self.sl_overhang_angle.setValueSilent(preset.overhang_angle)
+        for cb, val in ((self.cb_branch, self._branch_supports),
+                        (self.cb_anti_peel, self._raft_anti_peel)):
+            cb.blockSignals(True)
+            cb.setChecked(val)
+            cb.blockSignals(False)
+        # radio jakości (voxel pitch)
+        self._quality_mode = "final" if preset.voxel_pitch <= 0.12 else "preview"
+        for rb in (self.rb_preview, self.rb_final):
+            rb.blockSignals(True)
+        (self.rb_final if self._quality_mode == "final"
+         else self.rb_preview).setChecked(True)
+        for rb in (self.rb_preview, self.rb_final):
+            rb.blockSignals(False)
+
+        # resample kotwic (zmieniony rozstaw)
+        if self._apex_loop is not None:
+            from .supports import sample_apex_loop
+            self.anchors = sample_apex_loop(self._apex_loop, self._anchor_spacing)
+
+        # live recompute podpór (jak w _on_tilt_change)
+        if self._print_view and self.aligner_mesh is not None:
+            self._recompute_pillars()
+            self._refresh_pillars()
+            self._recompute_braces()
+            self._refresh_braces()
+            self._recompute_raft()
+            self._refresh_raft()
+            self.plotter.render()
+
+        print(
+            f"[qt_viewer] preset '{preset.name}' zastosowany "
+            f"(drukarka={preset.printer}, żywica={preset.resin}). "
+            f"Grubość/offset/pitch → kliknij 'Generuj' by przeliczyć nakładkę."
+        )
+
+    def _save_current_preset(self):
+        """Zapisz aktualne ustawienia jako nowy preset JSON w data/presets/."""
+        from .presets import PrintPreset
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Zapisz preset", "Nazwa presetu (np. 'Form 4B — moja żywica'):"
+        )
+        if not ok or not name.strip():
+            return
+        preset = PrintPreset(
+            name=name.strip(),
+            thickness=self.params.thickness,
+            inner_clearance=self.params.inner_clearance,
+            voxel_pitch=self.params.voxel_pitch,
+            tip_diameter=self.pillar_params.tip_diameter,
+            body_diameter=self.pillar_params.body_diameter,
+            tip_penetration=self.pillar_params.tip_penetration,
+            use_ball_tip=self.pillar_params.use_ball_tip,
+            raft_thickness=self._raft_thickness,
+            raft_band_width=self._raft_band_width,
+            anti_peel_tabs=(self._raft_n_tabs if self._raft_anti_peel else 0),
+            anchor_spacing=self._anchor_spacing,
+            overhang_angle=self._overhang_angle,
+            branch_supports=self._branch_supports,
+        )
+        path = preset.save()
+        self._reload_preset_combo()
+        idx = self.cmb_preset.findText(preset.name)
+        if idx >= 0:
+            self.cmb_preset.setCurrentIndex(idx)
+        print(f"[qt_viewer] zapisano preset → {path}")
 
     # ---------- S4.5: łączniki (zigzag bracing) ----------
     def _recompute_braces(self):

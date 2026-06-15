@@ -485,9 +485,13 @@ class PillarParams:
         stała wartość do podglądu geometrii w S3.
     """
     tip_diameter: float = 0.4        # mm — średnica kontaktu (snap-off interface)
+                                     # = Formlabs PreForm DEFAULT touchpoint (0.40mm).
+                                     # Zakres PreForm 0.10–1.00; <0.3 pęka od peel,
+                                     # tough/aligner resin (LT Comfort) → 0.4–0.5.
     tip_height: float = 1.0          # mm — wysokość zwężenia od body do tip
     body_diameter: float = 1.0       # mm — średnica trzonu
-    tip_penetration: float = 0.12    # mm — overlap z part (anti "ungrounded")
+    tip_penetration: float = 0.12    # mm — overlap z part (anti "ungrounded").
+                                     # Formlabs zaleca 0.10–0.15mm penetracji.
     use_ball_tip: bool = True        # sfera na kontakcie zamiast krążka:
                                      # uniform 360° kontakt na zakrzywionym
                                      # rim (cone-flat-circle traci kontakt
@@ -890,15 +894,163 @@ def generate_pillars_to_plane(
     return trimesh.util.concatenate(meshes)
 
 
+def _make_branch_strut(
+    origin: np.ndarray,
+    contact: np.ndarray,
+    strut_r: float,
+    tip_r: float,
+    use_ball: bool,
+    n_sides: int = 8,
+) -> trimesh.Trimesh:
+    """Pojedyncza gałąź: cienki ukośny strut od `origin` (na głównym pillarze)
+    do `contact` (nowy punkt na rim) + ball-tip kontaktowy.
+
+    Multi-solid (concat strut+ball) — slicer/PreForm unionuje, jak braces.
+    """
+    from trimesh.creation import cylinder, icosphere
+
+    parts = [cylinder(radius=strut_r, segment=[origin, contact], sections=n_sides)]
+    if use_ball and tip_r > 0:
+        ball = icosphere(subdivisions=1, radius=tip_r)
+        ball.apply_translation(np.asarray(contact, dtype=float))
+        parts.append(ball)
+    return trimesh.util.concatenate(parts)
+
+
+def generate_branch_supports(
+    main_anchors_print: np.ndarray,
+    branch_contacts_print: np.ndarray,
+    target_z: float,
+    params: PillarParams | None = None,
+    branch_drop: float = 2.5,
+    strut_diameter: float = 0.6,
+    min_dist_to_main: float = 1.2,
+    verbose: bool = True,
+) -> trimesh.Trimesh | None:
+    """Adaptacyjne podpory GAŁĘZIĄCE z głównych pillarów (mini-tree).
+
+    Zamiast pełnowysokiej nogi od raftu do każdego dodatkowego kontaktu, krótki
+    ukośny strut wychodzi z najbliższego GŁÓWNEGO pillara i sięga do nowego
+    punktu kontaktu na rim → ten sam contact-grip przy ułamku resinu (industry
+    standard tree/branching). Patrz [[support-research-findings]].
+
+    Dla każdego `branch_contacts_print[m]`:
+      1. najbliższy główny pillar (XY) = oś pionowa (XY stała) od kotwicy do target_z
+      2. origin = punkt na tej osi `branch_drop` mm niżej niż kontakt (clamp do osi)
+      3. strut origin→contact (Ø `strut_diameter`) + ball-tip (Formlabs touchpoint)
+
+    Pomija kontakty bliżej niż `min_dist_to_main` od istniejącej kotwicy (już
+    podparte głównym pillarem). Zwraca concat strutów (multi-solid) lub None.
+    """
+    if params is None:
+        params = PillarParams()
+    if (main_anchors_print is None or len(main_anchors_print) == 0
+            or branch_contacts_print is None or len(branch_contacts_print) == 0):
+        return None
+
+    from scipy.spatial import cKDTree
+
+    main = np.asarray(main_anchors_print, dtype=float)
+    tip_r = params.tip_diameter / 2.0
+    strut_r = strut_diameter / 2.0
+    use_ball = bool(getattr(params, "use_ball_tip", True))
+
+    tree = cKDTree(main[:, :2])
+    meshes = []
+    skipped = 0
+    for c in np.asarray(branch_contacts_print, dtype=float):
+        d_xy, idx = tree.query(c[:2])
+        if d_xy < min_dist_to_main:
+            skipped += 1
+            continue
+        a = main[idx]
+        # origin na osi głównego pillara (XY = a.xy), z = contact.z - branch_drop,
+        # clamp do [target_z, a.z] (nie wyjdź poza pillar)
+        oz = min(max(c[2] - branch_drop, target_z), a[2])
+        origin = np.array([a[0], a[1], oz])
+        # strut musi mieć sensowną długość
+        if np.linalg.norm(c - origin) < params.tip_diameter:
+            skipped += 1
+            continue
+        meshes.append(_make_branch_strut(origin, c, strut_r, tip_r, use_ball))
+
+    if verbose:
+        print(
+            f"[supports] branch supports: {len(meshes)} gałęzi z pillarów, "
+            f"pominięto {skipped} (za blisko głównej kotwicy / za krótkie)"
+        )
+    if not meshes:
+        return None
+    return trimesh.util.concatenate(meshes)
+
+
+def _make_raft_tabs(
+    loop2d: np.ndarray,
+    z_top: float,
+    z_bot: float,
+    n_tabs: int,
+    tab_radius: float,
+    n_sides: int = 14,
+) -> trimesh.Trimesh | None:
+    """Anti-peel pady: szerokie krążki na EKSTREMACH pętli kotwic.
+
+    Odklejanie wydruku od platformy zaczyna się od krawędzi o największym
+    momencie peel — dystalnie (molary, końce łuku) i przednio (labial). Tab =
+    lokalny krążek o promieniu `tab_radius` (> hw wstęgi) extrudowany na pełną
+    grubość raftu → DODATKOWE pole kontaktu z platformą dokładnie tam, gdzie
+    brzeg się podrywa. Grosze resinu vs grubienie całego raftu.
+
+    Rozmieszczenie: dzielimy pętlę na `n_tabs` sektorów kątowych wokół centroidu,
+    w każdym bierzemy punkt NAJDALEJ od centroidu (= najbardziej wystający brzeg).
+    """
+    from trimesh.creation import cylinder
+
+    if n_tabs <= 0 or len(loop2d) < 3 or tab_radius <= 0:
+        return None
+    c = loop2d.mean(axis=0)
+    rel = loop2d - c
+    ang = np.arctan2(rel[:, 1], rel[:, 0])
+    dist = np.linalg.norm(rel, axis=1)
+    bins = ((ang + np.pi) / (2.0 * np.pi) * n_tabs).astype(int) % n_tabs
+
+    h = float(z_top - z_bot)
+    z_mid = 0.5 * (z_top + z_bot)
+    meshes = []
+    seen = set()
+    for b in range(n_tabs):
+        idx = np.where(bins == b)[0]
+        if len(idx) == 0:
+            continue
+        pick = int(idx[np.argmax(dist[idx])])
+        if pick in seen:
+            continue
+        seen.add(pick)
+        cen = loop2d[pick]
+        cyl = cylinder(radius=tab_radius, height=h, sections=n_sides)
+        cyl.apply_translation([float(cen[0]), float(cen[1]), z_mid])
+        meshes.append(cyl)
+    if not meshes:
+        return None
+    return trimesh.util.concatenate(meshes)
+
+
 def make_raft(
     anchors_print: np.ndarray,
     z_top: float = 0.0,
     thickness: float = 1.5,
     band_width: float = 3.5,
     solid_disk: bool = False,
+    anti_peel_tabs: int = 0,
+    tab_radius: float = 2.5,
     verbose: bool = True,
 ) -> trimesh.Trimesh | None:
     """Raft U-kształtny = **wstęga** śledząca pętlę kotwic (gingival margin).
+
+    `anti_peel_tabs > 0`: dodaje N szerokich krążków-padów na ekstremach pętli
+    (dystalne/przednie brzegi o największym momencie peel) → extra footprint do
+    platformy bez grubienia całego raftu. Pozwala ścienić `thickness` (oszczędność
+    resinu — patrz [[support-research-findings]]: raft to ~74% resinu) zachowując
+    odporność na odklejenie. Patrz `_make_raft_tabs`.
 
     `solid_disk=True`: zamiast wstęgi U-kształtnej, raft = **filled disk**
     (wypukła otoczka kotwic, wypełniony środek). Likwiduje PreForm "Cup
@@ -970,10 +1122,14 @@ def make_raft(
             trimesh.repair.fix_normals(raft)
         except Exception:
             pass
+        if anti_peel_tabs > 0:
+            tabs = _make_raft_tabs(hull_pts, z_top, z_bot, anti_peel_tabs, tab_radius)
+            if tabs is not None:
+                raft = trimesh.util.concatenate([raft, tabs])
         if verbose:
             print(
                 f"[supports] raft SOLID DISK: hull {M} pkt, grubość {thickness}mm, "
-                f"watertight={raft.is_watertight}"
+                f"anti-peel taby={anti_peel_tabs}, watertight={raft.is_watertight}"
             )
         return raft
     hw = band_width / 2.0
@@ -1018,10 +1174,17 @@ def make_raft(
         trimesh.repair.fix_normals(raft)
     except Exception:
         pass
+    n_tab = 0
+    if anti_peel_tabs > 0:
+        tabs = _make_raft_tabs(loop, z_top, z_bot, anti_peel_tabs, tab_radius)
+        if tabs is not None:
+            n_tab = int(len(tabs.vertices) > 0) and anti_peel_tabs
+            raft = trimesh.util.concatenate([raft, tabs])
     if verbose:
         print(
             f"[supports] raft U-band: {N} pkt pętli, szer {band_width}mm, "
-            f"grubość {thickness}mm, watertight={raft.is_watertight}"
+            f"grubość {thickness}mm, anti-peel taby={n_tab}, "
+            f"watertight={raft.is_watertight}"
         )
     return raft
 

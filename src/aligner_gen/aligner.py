@@ -32,7 +32,7 @@ from .sdf import (
 
 @dataclass
 class AlignerParams:
-    thickness: float = 0.6              # grubość ścianki nakładki [mm]
+    thickness: float = 1.0              # grubość ścianki nakładki [mm] (klinicznie 0.5–1.0; sztywniejsza nakładka = 1.0)
     inner_clearance: float = 0.05       # luz między zębem a wnętrzem nakładki [mm]
     close_radius: float = 1.5           # R closing dla bridgowania embrasur [mm]
     selection_radius: float = 3.0       # max odległość voxela od zaznaczonej powierzchni [mm]
